@@ -1,15 +1,21 @@
 package org.zalando.nakadi.webservice;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.jayway.restassured.response.Response;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.common.PartitionInfo;
 import org.hamcrest.Matchers;
 import org.junit.Before;
+import org.junit.BeforeClass;
 import org.junit.Test;
 import org.springframework.http.HttpStatus;
-import org.zalando.nakadi.domain.Cursor;
+import org.zalando.nakadi.domain.EventType;
+import org.zalando.nakadi.exceptions.NoSuchEventTypeException;
 import org.zalando.nakadi.repository.kafka.KafkaTestHelper;
+import org.zalando.nakadi.utils.EventTypeTestBuilder;
+import org.zalando.nakadi.view.Cursor;
+import org.zalando.nakadi.webservice.utils.NakadiTestUtils;
 
 import java.io.IOException;
 import java.util.List;
@@ -28,9 +34,20 @@ import static org.zalando.nakadi.webservice.utils.JsonTestHelper.asMapsList;
 
 public class PartitionsControllerAT extends BaseAT {
 
+    private static String eventTypeName;
+    private static String topicName;
     private KafkaTestHelper kafkaHelper;
 
     private Map<String, List<PartitionInfo>> actualTopics;
+
+    @BeforeClass
+    public static void setupClass() throws JsonProcessingException, NoSuchEventTypeException {
+        final EventType eventType = EventTypeTestBuilder.builder().build();
+        NakadiTestUtils.createEventTypeInNakadi(eventType);
+        // expect only one timeline, because we just created event type
+        topicName = BaseAT.TIMELINE_REPOSITORY.listTimelinesOrdered(eventType.getName()).get(0).getTopic();
+        eventTypeName = eventType.getName();
+    }
 
     @Before
     public void before() {
@@ -41,7 +58,7 @@ public class PartitionsControllerAT extends BaseAT {
     @Test
     public void whenListPartitionsThenOk() throws IOException {
         // ACT //
-        final Response response = when().get(String.format("/event-types/%s/partitions", EVENT_TYPE_NAME));
+        final Response response = when().get(String.format("/event-types/%s/partitions", eventTypeName));
 
         // ASSERT //
         response.then().statusCode(HttpStatus.OK.value());
@@ -54,11 +71,24 @@ public class PartitionsControllerAT extends BaseAT {
                 .map(map -> map.get("partition"))
                 .collect(Collectors.toSet());
         final Set<String> actualPartitions = actualTopics
-                .get(TEST_TOPIC)
+                .get(topicName)
                 .stream()
                 .map(pInfo -> Integer.toString(pInfo.partition()))
                 .collect(Collectors.toSet());
         assertThat(partitions, equalTo(actualPartitions));
+    }
+
+    @Test
+    public void testBeginShownForNoEvents() throws IOException {
+        final EventType eventType = NakadiTestUtils.createEventType();
+        when().get(String.format("/event-types/%s/partitions", eventType.getName())).then()
+                .statusCode(HttpStatus.OK.value())
+                .body("oldest_available_offset[0]", equalTo("001-0001-000000000000000000"))
+                .body("newest_available_offset[0]", equalTo("001-0001--1"));
+        when().get(String.format("/event-types/%s/partitions/%d", eventType.getName(), 0)).then()
+                .statusCode(HttpStatus.OK.value())
+                .body("oldest_available_offset", equalTo("001-0001-000000000000000000"))
+                .body("newest_available_offset", equalTo("001-0001--1"));
     }
 
     @Test
@@ -75,7 +105,7 @@ public class PartitionsControllerAT extends BaseAT {
     public void whenListPartitionsAndWriteMessageThenOffsetInPartitionIsIncreased() throws ExecutionException,
             InterruptedException, IOException {
         // ACT //
-        final String url = String.format("/event-types/%s/partitions", EVENT_TYPE_NAME);
+        final String url = String.format("/event-types/%s/partitions", eventTypeName);
         final List<Map<String, String>> partitionsInfoBefore = asMapsList(get(url).print());
 
         writeMessageToPartition(0);
@@ -90,11 +120,22 @@ public class PartitionsControllerAT extends BaseAT {
     @Test
     public void whenGetPartitionThenOk() throws IOException {
         // ACT //
-        final Response response = when().get(String.format("/event-types/%s/partitions/0", EVENT_TYPE_NAME));
+        final Response response = when().get(String.format("/event-types/%s/partitions/0", eventTypeName));
 
         // ASSERT //
         response.then().statusCode(HttpStatus.OK.value());
         validatePartitionStructure(asMap(response.print()));
+    }
+
+    @Test
+    public void whenGetPartitionWithConsumedOffsetThenOk() throws IOException {
+        // ACT //
+        final Response response = when().get(String.format("/event-types/%s/partitions/0?consumed_offset=BEGIN",
+                eventTypeName));
+
+        // ASSERT //
+        response.then().statusCode(HttpStatus.OK.value());
+        validateUnconsumedEventsStructure(asMap(response.print()));
     }
 
     @Test
@@ -110,7 +151,7 @@ public class PartitionsControllerAT extends BaseAT {
     @Test
     public void whenGetPartitionThenPartitionNotFound() throws IOException {
         when()
-                .get(String.format("/event-types/%s/partitions/43766", EVENT_TYPE_NAME))
+                .get(String.format("/event-types/%s/partitions/43766", eventTypeName))
                 .then()
                 .statusCode(HttpStatus.NOT_FOUND.value())
                 .and()
@@ -121,7 +162,7 @@ public class PartitionsControllerAT extends BaseAT {
     public void whenGetPartitionAndWriteMessageThenOffsetInPartitionIsIncreased() throws ExecutionException,
             InterruptedException, IOException {
         // ACT //
-        final String url = String.format("/event-types/%s/partitions/0", EVENT_TYPE_NAME);
+        final String url = String.format("/event-types/%s/partitions/0", eventTypeName);
         final Map<String, String> partitionInfoBefore = asMap(get(url).print());
 
         writeMessageToPartition(0);
@@ -149,12 +190,12 @@ public class PartitionsControllerAT extends BaseAT {
 
     private Long getNewestOffsetAsLong(final Map<String, String> partitionInfo) {
         final String offset = partitionInfo.get("newest_available_offset");
-        return Cursor.BEFORE_OLDEST_OFFSET.equals(offset) ? -1 : Long.parseLong(offset);
+        return Cursor.BEFORE_OLDEST_OFFSET.equals(offset) ? -1 : Long.parseLong(offset.split("-", 3)[2]);
     }
 
     private void writeMessageToPartition(final int partition) throws InterruptedException, ExecutionException {
         final KafkaProducer<String, String> producer = kafkaHelper.createProducer();
-        final ProducerRecord<String, String> producerRecord = new ProducerRecord<>(TEST_TOPIC, partition, "blahKey",
+        final ProducerRecord<String, String> producerRecord = new ProducerRecord<>(topicName, partition, "blahKey",
                 "blahValue");
         producer.send(producerRecord).get();
     }
@@ -163,6 +204,13 @@ public class PartitionsControllerAT extends BaseAT {
         assertThat(pMap.get("partition"), Matchers.notNullValue());
         assertThat(pMap.get("newest_available_offset"), Matchers.notNullValue());
         assertThat(pMap.get("oldest_available_offset"), Matchers.notNullValue());
+    }
+
+    private void validateUnconsumedEventsStructure(final Map<String, String> pMap) {
+        assertThat(pMap.get("partition"), Matchers.notNullValue());
+        assertThat(pMap.get("newest_available_offset"), Matchers.notNullValue());
+        assertThat(pMap.get("oldest_available_offset"), Matchers.notNullValue());
+        assertThat(pMap.get("unconsumed_events"), Matchers.notNullValue());
     }
 
 }

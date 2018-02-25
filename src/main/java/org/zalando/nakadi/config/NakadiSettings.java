@@ -3,6 +3,8 @@ package org.zalando.nakadi.config;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
+import org.zalando.nakadi.domain.ResourceAuthorizationAttribute;
+import org.zalando.nakadi.plugin.api.authz.AuthorizationAttribute;
 
 @Component
 public class NakadiSettings {
@@ -15,6 +17,11 @@ public class NakadiSettings {
     private final long defaultCommitTimeoutSeconds;
     private final long kafkaPollTimeoutMs;
     private final long kafkaSendTimeoutMs;
+    private final long timelineWaitTimeoutMs;
+    private final long eventMaxBytes;
+    private final int maxSubscriptionPartitions;
+    private final AuthorizationAttribute defaultAdmin;
+    private final String warnAllDataAccessMessage;
 
     @Autowired
     public NakadiSettings(@Value("${nakadi.topic.max.partitionNum}") final int maxTopicPartitionCount,
@@ -24,7 +31,13 @@ public class NakadiSettings {
                           @Value("${nakadi.topic.default.rotationMs}") final long defaultTopicRotationMs,
                           @Value("${nakadi.stream.default.commitTimeout}") final long defaultCommitTimeoutSeconds,
                           @Value("${nakadi.kafka.poll.timeoutMs}") final long kafkaPollTimeoutMs,
-                          @Value("${nakadi.kafka.send.timeoutMs}") final long kafkaSendTimeoutMs) {
+                          @Value("${nakadi.kafka.send.timeoutMs}") final long kafkaSendTimeoutMs,
+                          @Value("${nakadi.timeline.wait.timeoutMs}") final long timelineWaitTimeoutMs,
+                          @Value("${nakadi.event.max.bytes}") final long eventMaxBytes,
+                          @Value("${nakadi.subscription.maxPartitions}") final int maxSubscriptionPartitions,
+                          @Value("${nakadi.admin.default.dataType}") final String defaultAdminDataType,
+                          @Value("${nakadi.admin.default.value}") final String defaultAdminValue,
+                          @Value("${nakadi.authz.warnAllDataAccessMessage}") final String warnAllDataAccessMessage) {
         this.maxTopicPartitionCount = maxTopicPartitionCount;
         this.defaultTopicPartitionCount = defaultTopicPartitionCount;
         this.defaultTopicReplicaFactor = defaultTopicReplicaFactor;
@@ -33,6 +46,11 @@ public class NakadiSettings {
         this.defaultCommitTimeoutSeconds = defaultCommitTimeoutSeconds;
         this.kafkaPollTimeoutMs = kafkaPollTimeoutMs;
         this.kafkaSendTimeoutMs = kafkaSendTimeoutMs;
+        this.eventMaxBytes = eventMaxBytes;
+        this.timelineWaitTimeoutMs = timelineWaitTimeoutMs;
+        this.maxSubscriptionPartitions = maxSubscriptionPartitions;
+        this.defaultAdmin = new ResourceAuthorizationAttribute(defaultAdminDataType, defaultAdminValue);
+        this.warnAllDataAccessMessage = warnAllDataAccessMessage;
     }
 
     public int getDefaultTopicPartitionCount() {
@@ -67,4 +85,23 @@ public class NakadiSettings {
         return kafkaSendTimeoutMs;
     }
 
+    public long getEventMaxBytes() {
+        return eventMaxBytes;
+    }
+
+    public long getTimelineWaitTimeoutMs() {
+        return timelineWaitTimeoutMs;
+    }
+
+    public int getMaxSubscriptionPartitions() {
+        return maxSubscriptionPartitions;
+    }
+
+    public AuthorizationAttribute getDefaultAdmin() {
+        return defaultAdmin;
+    }
+
+    public String getWarnAllDataAccessMessage() {
+        return warnAllDataAccessMessage;
+    }
 }

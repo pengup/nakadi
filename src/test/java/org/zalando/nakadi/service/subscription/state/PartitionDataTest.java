@@ -1,50 +1,72 @@
 package org.zalando.nakadi.service.subscription.state;
 
-import java.util.SortedMap;
-import java.util.concurrent.TimeUnit;
+import org.junit.BeforeClass;
 import org.junit.Test;
+import org.zalando.nakadi.domain.ConsumedEvent;
+import org.zalando.nakadi.domain.NakadiCursor;
+import org.zalando.nakadi.domain.Storage;
+import org.zalando.nakadi.domain.Timeline;
+import org.zalando.nakadi.repository.kafka.KafkaCursor;
+
+import java.util.Comparator;
+import java.util.List;
+import java.util.concurrent.TimeUnit;
 
 import static java.lang.System.currentTimeMillis;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 public class PartitionDataTest {
 
+    private static Timeline firstTimeline = mock(Timeline.class);
+    private static final Comparator<NakadiCursor> COMP = Comparator.comparing(NakadiCursor::getOffset);
+
+    @BeforeClass
+    public static void initTimeline() {
+        when(firstTimeline.getStorage()).thenReturn(new Storage("", Storage.Type.KAFKA));
+    }
+
+    private static NakadiCursor createCursor(final long offset) {
+        return new KafkaCursor("x", 0, offset).toNakadiCursor(firstTimeline);
+    }
+
     @Test
     public void onNewOffsetsShouldSupportRollback() {
-        final PartitionData pd = new PartitionData(null, 100L);
-        final PartitionData.CommitResult cr = pd.onCommitOffset(90L);
+        final PartitionData pd = new PartitionData(COMP, null, createCursor(100L), System.currentTimeMillis());
+        final PartitionData.CommitResult cr = pd.onCommitOffset(createCursor(90L));
 
         assertEquals(0L, cr.committedCount);
         assertEquals(true, cr.seekOnKafka);
-        assertEquals(90L, pd.getSentOffset());
+        assertEquals(90L, Long.parseLong(pd.getSentOffset().getOffset()));
         assertEquals(0L, pd.getUnconfirmed());
     }
 
     @Test
     public void onNewOffsetsShouldSupportCommitInFuture() {
-        final PartitionData pd = new PartitionData(null, 100L);
-        final PartitionData.CommitResult cr = pd.onCommitOffset(110L);
+        final PartitionData pd = new PartitionData(COMP, null, createCursor(100L), System.currentTimeMillis());
+        final PartitionData.CommitResult cr = pd.onCommitOffset(createCursor(110L));
 
-        assertEquals(10L, cr.committedCount);
+        assertEquals(0L, cr.committedCount);
         assertEquals(true, cr.seekOnKafka);
-        assertEquals(110L, pd.getSentOffset());
+        assertEquals(110L, Long.parseLong(pd.getSentOffset().getOffset()));
         assertEquals(0L, pd.getUnconfirmed());
     }
 
     @Test
     public void normalOperationShouldNotReconfigureKafkaConsumer() {
-        final PartitionData pd = new PartitionData(null, 100L);
+        final PartitionData pd = new PartitionData(COMP, null, createCursor(100L), System.currentTimeMillis());
         for (long i = 0; i < 100; ++i) {
-            pd.addEventFromKafka(100L + i + 1, "test_" + i);
+            pd.addEvent(new ConsumedEvent(("test_" + i).getBytes(), createCursor(100L + i + 1)));
         }
         // Now say to it that it was sent
         pd.takeEventsToStream(currentTimeMillis(), 1000, 0L);
         assertEquals(100L, pd.getUnconfirmed());
         for (long i = 0; i < 10; ++i) {
-            final PartitionData.CommitResult cr = pd.onCommitOffset(110L + i * 10L);
+            final PartitionData.CommitResult cr = pd.onCommitOffset(createCursor(110L + i * 10L));
             assertEquals(10L, cr.committedCount);
             assertFalse(cr.seekOnKafka);
             assertEquals(90L - i * 10L, pd.getUnconfirmed());
@@ -52,38 +74,13 @@ public class PartitionDataTest {
     }
 
     @Test
-    public void eventsMustBeReturnedInGuaranteedOrder() {
-        final PartitionData pd = new PartitionData(null, 100L);
-        for (long i = 0; i < 100; ++i) {
-            pd.addEventFromKafka(200L - i, "test_" + (200L - i));
-        }
-        pd.addEventFromKafka(201L, "fake");
-        for (int i = 0; i < 10; ++i) {
-            final SortedMap<Long, String> data = pd.takeEventsToStream(currentTimeMillis(), 10, 0L);
-            assertNotNull(data);
-            assertEquals(10, data.size());
-            assertEquals((i + 1) * 10, pd.getUnconfirmed());
-            assertEquals(0, pd.getKeepAliveInARow());
-            assertEquals(100L + i * 10L + 1L, data.firstKey().longValue());
-            assertEquals(100L + i * 10L + 10L, data.lastKey().longValue());
-            data.forEach((k, v) -> assertEquals("test_" + k, v));
-        }
-        final SortedMap<Long, String> data = pd.takeEventsToStream(currentTimeMillis(), 10, 0L);
-        assertNotNull(data);
-        assertEquals(1, data.size());
-        assertEquals(201L, data.firstKey().longValue());
-        assertEquals("fake", data.get(data.firstKey()));
-        assertEquals(0, pd.getKeepAliveInARow());
-    }
-
-    @Test
     public void keepAliveCountShouldIncreaseOnEachEmptyCall() {
-        final PartitionData pd = new PartitionData(null, 100L);
+        final PartitionData pd = new PartitionData(COMP, null, createCursor(100L), System.currentTimeMillis());
         for (int i = 0; i < 100; ++i) {
             pd.takeEventsToStream(currentTimeMillis(), 10, 0L);
             assertEquals(i + 1, pd.getKeepAliveInARow());
         }
-        pd.addEventFromKafka(101L, "");
+        pd.addEvent(new ConsumedEvent("".getBytes(), createCursor(101L)));
         assertEquals(100, pd.getKeepAliveInARow());
         pd.takeEventsToStream(currentTimeMillis(), 10, 0L);
         assertEquals(0, pd.getKeepAliveInARow());
@@ -92,30 +89,34 @@ public class PartitionDataTest {
     }
 
     @Test
-    public void eventsShouldBeStreamedOnTimeout() throws InterruptedException {
+    public void eventsShouldBeStreamedOnTimeout() {
         final long timeout = TimeUnit.SECONDS.toMillis(1);
-        final PartitionData pd = new PartitionData(null, 100L);
+        long currentTime = System.currentTimeMillis();
+
+        final PartitionData pd = new PartitionData(COMP, null, createCursor(100L), currentTime);
         for (int i = 0; i < 100; ++i) {
-            pd.addEventFromKafka(i + 100L + 1, "test");
+            pd.addEvent(new ConsumedEvent("test".getBytes(), createCursor(i + 100L + 1)));
         }
-        SortedMap<Long, String> data = pd.takeEventsToStream(currentTimeMillis(), 1000, timeout);
+        List<ConsumedEvent> data = pd.takeEventsToStream(currentTime, 1000, timeout);
         assertNull(data);
         assertEquals(0, pd.getKeepAliveInARow());
-        Thread.sleep(timeout);
 
-        data = pd.takeEventsToStream(currentTimeMillis(), 1000, timeout);
+        currentTime += timeout + 1;
+
+        data = pd.takeEventsToStream(currentTime, 1000, timeout);
         assertNotNull(data);
         assertEquals(100, data.size());
 
         for (int i = 100; i < 200; ++i) {
-            pd.addEventFromKafka(i + 100L + 1, "test");
+            pd.addEvent(new ConsumedEvent("test".getBytes(), createCursor(i + 100L + 1)));
         }
-        data = pd.takeEventsToStream(currentTimeMillis(), 1000, timeout);
+        data = pd.takeEventsToStream(currentTime, 1000, timeout);
         assertNull(data);
         assertEquals(0, pd.getKeepAliveInARow());
-        Thread.sleep(timeout);
 
-        data = pd.takeEventsToStream(currentTimeMillis(), 1000, timeout);
+        currentTime += timeout + 1;
+
+        data = pd.takeEventsToStream(currentTime, 1000, timeout);
         assertNotNull(data);
         assertEquals(100, data.size());
     }
@@ -123,12 +124,12 @@ public class PartitionDataTest {
     @Test
     public void eventsShouldBeStreamedOnBatchSize() {
         final long timeout = TimeUnit.SECONDS.toMillis(1);
-        final PartitionData pd = new PartitionData(null, 100L);
+        final PartitionData pd = new PartitionData(COMP, null, createCursor(100L), System.currentTimeMillis());
         for (int i = 0; i < 100; ++i) {
-            pd.addEventFromKafka(i + 100L + 1, "test");
+            pd.addEvent(new ConsumedEvent("test".getBytes(), createCursor(i + 100L + 1)));
         }
         assertNull(pd.takeEventsToStream(currentTimeMillis(), 1000, timeout));
-        final SortedMap<Long, String> eventsToStream = pd.takeEventsToStream(currentTimeMillis(), 99, timeout);
+        final List<ConsumedEvent> eventsToStream = pd.takeEventsToStream(currentTimeMillis(), 99, timeout);
         assertNotNull(eventsToStream);
         assertEquals(99, eventsToStream.size());
     }

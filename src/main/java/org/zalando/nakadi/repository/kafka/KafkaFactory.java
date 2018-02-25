@@ -2,26 +2,22 @@ package org.zalando.nakadi.repository.kafka;
 
 import com.codahale.metrics.Counter;
 import com.codahale.metrics.MetricRegistry;
-import java.util.List;
-import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.locks.Lock;
-import java.util.concurrent.locks.ReadWriteLock;
-import java.util.concurrent.locks.ReentrantReadWriteLock;
-import javax.annotation.Nullable;
 import org.apache.kafka.clients.consumer.Consumer;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.Producer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.context.annotation.Profile;
-import org.springframework.stereotype.Component;
 
-@Component
-@Profile("!test")
+import javax.annotation.Nullable;
+import java.util.Map;
+import java.util.Properties;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+
 public class KafkaFactory {
 
     private final KafkaLocationManager kafkaLocationManager;
@@ -34,7 +30,6 @@ public class KafkaFactory {
 
     private static final Logger LOG = LoggerFactory.getLogger(KafkaFactory.class);
 
-    @Autowired
     public KafkaFactory(final KafkaLocationManager kafkaLocationManager, final MetricRegistry metricRegistry) {
         this.kafkaLocationManager = kafkaLocationManager;
         this.useCountMetric = metricRegistry.counter("kafka.producer.use_count");
@@ -137,13 +132,21 @@ public class KafkaFactory {
         }
     }
 
-    public Consumer<String, String> getConsumer() {
-        return new KafkaConsumer<>(kafkaLocationManager.getKafkaConsumerProperties());
+    public Consumer<byte[], byte[]> getConsumer(final Properties properties) {
+        return new KafkaConsumer<>(properties);
     }
 
-    public NakadiKafkaConsumer createNakadiConsumer(final String topic, final List<KafkaCursor> kafkaCursors,
-                                                    final long pollTimeout) {
-        return new NakadiKafkaConsumer(getConsumer(), topic, kafkaCursors, pollTimeout);
+    public Consumer<byte[], byte[]> getConsumer() {
+        return getConsumer(kafkaLocationManager.getKafkaConsumerProperties());
+    }
+
+    public Consumer<byte[], byte[]> getConsumer(@Nullable final String clientId) {
+        final Properties properties = kafkaLocationManager.getKafkaConsumerProperties();
+        // TODO: the line bellow has been commented after a bug in Kafka's 0.9.x throttling feature has been detected.
+        // once Kafka is upgraded, we are going to enable it back. More on how it works can be found at
+        // https://docs.google.com/document/d/1JDgsBemNqS0SrNpWUL90205u0MFmSMnOqrC-ENAb6TM/edit
+        // properties.put("client.id", clientId);
+        return this.getConsumer(properties);
     }
 
 }

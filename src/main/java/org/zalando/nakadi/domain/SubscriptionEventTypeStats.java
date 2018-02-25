@@ -1,19 +1,22 @@
 package org.zalando.nakadi.domain;
 
 import com.fasterxml.jackson.annotation.JsonInclude;
+import com.fasterxml.jackson.annotation.JsonProperty;
 
 import javax.annotation.Nullable;
 import javax.annotation.concurrent.Immutable;
 import java.util.Collections;
-import java.util.Set;
+import java.util.List;
 
 @Immutable
 public class SubscriptionEventTypeStats {
 
     private final String eventType;
-    private final Set<Partition> partitions;
+    private final List<Partition> partitions;
 
-    public SubscriptionEventTypeStats(final String eventType, final Set<Partition> partitions) {
+    public SubscriptionEventTypeStats(
+            @JsonProperty("event_type") final String eventType,
+            @JsonProperty("partitions") final List<Partition> partitions) {
         this.eventType = eventType;
         this.partitions = partitions;
     }
@@ -22,8 +25,8 @@ public class SubscriptionEventTypeStats {
         return eventType;
     }
 
-    public Set<Partition> getPartitions() {
-        return Collections.unmodifiableSet(partitions);
+    public List<Partition> getPartitions() {
+        return Collections.unmodifiableList(partitions);
     }
 
     @Immutable
@@ -34,10 +37,11 @@ public class SubscriptionEventTypeStats {
         private final Long unconsumedEvents;
         private final String streamId;
 
-        public Partition(final String partition,
-                         final String state,
-                         @Nullable final Long unconsumedEvents,
-                         final String streamId) {
+        public Partition(
+                @JsonProperty("partition") final String partition,
+                @JsonProperty("state") final String state,
+                @JsonProperty("unconsumed_events") @Nullable final Long unconsumedEvents,
+                @JsonProperty("stream_id") final String streamId) {
             this.partition = partition;
             this.state = state;
             this.unconsumedEvents = unconsumedEvents;

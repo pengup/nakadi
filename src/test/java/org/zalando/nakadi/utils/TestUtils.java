@@ -8,6 +8,7 @@ import org.echocat.jomon.runtime.concurrent.RetryForSpecifiedTimeStrategy;
 import org.joda.time.DateTime;
 import org.joda.time.DateTimeZone;
 import org.json.JSONObject;
+import org.mockito.ArgumentCaptor;
 import org.springframework.http.converter.StringHttpMessageConverter;
 import org.springframework.http.converter.json.MappingJackson2HttpMessageConverter;
 import org.springframework.test.web.servlet.MockMvc;
@@ -16,34 +17,47 @@ import org.springframework.validation.FieldError;
 import org.zalando.nakadi.config.JsonConfig;
 import org.zalando.nakadi.domain.BatchItem;
 import org.zalando.nakadi.domain.EventType;
+import org.zalando.nakadi.domain.Storage;
 import org.zalando.nakadi.domain.Subscription;
+import org.zalando.nakadi.domain.Timeline;
+import org.zalando.nakadi.exceptions.runtime.AccessDeniedException;
+import org.zalando.nakadi.plugin.api.authz.AuthorizationService;
+import org.zalando.nakadi.plugin.api.authz.Resource;
 import org.zalando.nakadi.problem.ValidationProblem;
+import org.zalando.nakadi.service.NakadiKpiPublisher;
 import org.zalando.problem.Problem;
 
 import java.io.IOException;
 import java.util.Arrays;
+import java.util.Date;
 import java.util.List;
 import java.util.Random;
 import java.util.UUID;
+import java.util.function.Supplier;
+import java.util.stream.Stream;
 
 import static java.util.stream.Collectors.toList;
 import static java.util.stream.IntStream.range;
 import static org.echocat.jomon.runtime.concurrent.Retryer.executeWithRetry;
+import static org.hamcrest.Matchers.is;
+import static org.junit.Assert.assertThat;
+import static org.mockito.Matchers.eq;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 import static org.springframework.test.web.servlet.setup.MockMvcBuilders.standaloneSetup;
 import static org.zalando.nakadi.utils.RandomSubscriptionBuilder.builder;
 
 public class TestUtils {
 
-    public static final String OWNING_APPLICATION = "event-producer-application";
-
     private static final String VALID_EVENT_TYPE_NAME_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMOPQRSTUVWXYZ";
 
-    private static final String VALID_EVENT_BODY_CHARS = VALID_EVENT_TYPE_NAME_CHARS + " \t!@#$%^&*()=+-_";
-
     private static final Random RANDOM = new Random();
-    private static final ObjectMapper OBJECT_MAPPER = new JsonConfig().jacksonObjectMapper();
+    public static final ObjectMapper OBJECT_MAPPER = new JsonConfig().jacksonObjectMapper();
+    public static final JsonTestHelper JSON_TEST_HELPER = new JsonTestHelper(OBJECT_MAPPER);
+    public static final MappingJackson2HttpMessageConverter JACKSON_2_HTTP_MESSAGE_CONVERTER =
+            new MappingJackson2HttpMessageConverter(OBJECT_MAPPER);
 
     public static String randomUUID() {
         return UUID.randomUUID().toString();
@@ -54,7 +68,7 @@ public class TestUtils {
     }
 
     public static String randomString() {
-        final int length = RANDOM.nextInt(500);
+        final int length = RANDOM.nextInt(100);
 
         String s = "";
 
@@ -79,6 +93,26 @@ public class TestUtils {
 
     }
 
+    public static String randomStringOfLength(final int length) {
+        final StringBuilder sb = new StringBuilder();
+
+        for (int i = 0; i < length; i++) {
+            sb.append((char) RANDOM.nextInt(128));
+        }
+
+        return sb.toString();
+    }
+
+    public static String randomValidStringOfLength(final int length) {
+        final StringBuilder sb = new StringBuilder();
+
+        for (int i = 0; i < length; i++) {
+            sb.append(VALID_EVENT_TYPE_NAME_CHARS.charAt(RANDOM.nextInt(VALID_EVENT_TYPE_NAME_CHARS.length())));
+        }
+
+        return sb.toString();
+    }
+
     public static String randomValidEventTypeName() {
         return String.format("%s.%s", randomString(VALID_EVENT_TYPE_NAME_CHARS),
                 randomString(VALID_EVENT_TYPE_NAME_CHARS));
@@ -96,16 +130,19 @@ public class TestUtils {
         return randomUInt() * randomUInt();
     }
 
-    public static String randomULongAsString() {
-        return Long.toString(randomULong());
-    }
-
     public static String resourceAsString(final String resourceName, final Class clazz) throws IOException {
         return IOUtils.toString(clazz.getResourceAsStream(resourceName));
     }
 
     public static EventType buildDefaultEventType() {
         return EventTypeTestBuilder.builder().build();
+    }
+
+    public static AccessDeniedException mockAccessDeniedException() {
+        final Resource resource = mock(Resource.class);
+        when(resource.getName()).thenReturn("some-name");
+        when(resource.getType()).thenReturn("some-type");
+        return new AccessDeniedException(AuthorizationService.Operation.READ, resource);
     }
 
     public static String readFile(final String filename) throws IOException {
@@ -122,13 +159,9 @@ public class TestUtils {
         return OBJECT_MAPPER.readValue(json, EventType.class);
     }
 
-    public static MappingJackson2HttpMessageConverter createMessageConverter() {
-        return new MappingJackson2HttpMessageConverter(new JsonConfig().jacksonObjectMapper());
-    }
-
     public static MockMvc mockMvcForController(final Object controller) {
         return standaloneSetup(controller)
-                .setMessageConverters(new StringHttpMessageConverter(), createMessageConverter())
+                .setMessageConverters(new StringHttpMessageConverter(), JACKSON_2_HTTP_MESSAGE_CONVERTER)
                 .build();
     }
 
@@ -144,20 +177,27 @@ public class TestUtils {
         waitFor(runnable, 10000, 500);
     }
 
-    public static void waitFor(final Runnable runnable, final int timeoutMs) {
+    public static void waitFor(final Runnable runnable, final long timeoutMs) {
         waitFor(runnable, timeoutMs, 500);
     }
 
     @SuppressWarnings("unchecked")
-    public static void waitFor(final Runnable runnable, final int timeoutMs, final int intervalMs) {
+    public static void waitFor(final Runnable runnable, final long timeoutMs, final int intervalMs,
+                               final Class<? extends  Throwable>... additionalException) {
+        final List<Class<? extends Throwable>> leadToRetry =
+                Stream.concat(Stream.of(additionalException), Stream.of(AssertionError.class)).collect(toList());
         executeWithRetry(
                 runnable,
                 new RetryForSpecifiedTimeStrategy<Void>(timeoutMs)
-                        .withExceptionsThatForceRetry(AssertionError.class)
+                        .withExceptionsThatForceRetry(leadToRetry)
                         .withWaitBetweenEachTry(intervalMs));
     }
 
-    public static BatchItem createBatch(final JSONObject event) {
+    public static BatchItem createBatchItem(final JSONObject event) {
+        return new BatchItem(event.toString());
+    }
+
+    public static BatchItem createBatchItem(final String event) {
         return new BatchItem(event);
     }
 
@@ -167,10 +207,37 @@ public class TestUtils {
         return new DateTime(randomMillis, DateTimeZone.UTC);
     }
 
-    public static List<Subscription> createRandomSubscriptions(final int count) {
+    public static List<Subscription> createRandomSubscriptions(final int count, final String owningApp) {
         return range(0, count)
-                .mapToObj(i -> builder().build())
+                .mapToObj(i -> builder().withOwningApplication(owningApp).build())
                 .collect(toList());
     }
 
+    public static List<Subscription> createRandomSubscriptions(final int count) {
+        return createRandomSubscriptions(count, randomTextString());
+    }
+
+    public static Timeline buildTimeline(final String etName) {
+        return new Timeline(etName, 0, new Storage("ccc", Storage.Type.KAFKA), randomUUID(), new Date());
+    }
+
+    public static Timeline buildTimeline(final String etName, final String topic, final Date createdAt) {
+        return new Timeline(etName, 0, new Storage("ccc", Storage.Type.KAFKA), topic, createdAt);
+    }
+
+    public static Timeline buildTimelineWithTopic(final String topic) {
+        return new Timeline(randomUUID(), 0, new Storage("ccc", Storage.Type.KAFKA), topic, new Date());
+    }
+
+    public static String toTimelineOffset(final long offset) {
+        return String.format("001-0001-%018d", offset);
+    }
+
+    @SuppressWarnings("unchecked")
+    public static void checkKPIEventSubmitted(final NakadiKpiPublisher nakadiKpiPublisher, final String eventType,
+                                              final JSONObject expectedEvent) {
+        final ArgumentCaptor<Supplier> supplierCaptor = ArgumentCaptor.forClass(Supplier.class);
+        verify(nakadiKpiPublisher, times(1)).publish(eq(eventType), supplierCaptor.capture());
+        assertThat(expectedEvent.similar(supplierCaptor.getValue().get()), is(true));
+    }
 }

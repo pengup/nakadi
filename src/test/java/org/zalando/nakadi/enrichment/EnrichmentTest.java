@@ -1,20 +1,20 @@
 package org.zalando.nakadi.enrichment;
 
+import org.json.JSONObject;
+import org.junit.Test;
+import org.mockito.Mockito;
 import org.zalando.nakadi.domain.BatchItem;
 import org.zalando.nakadi.domain.EnrichmentStrategyDescriptor;
 import org.zalando.nakadi.domain.EventType;
 import org.zalando.nakadi.exceptions.InvalidEventTypeException;
-import org.json.JSONObject;
-import org.junit.Test;
-import org.mockito.Mockito;
 
-import static org.zalando.nakadi.domain.EventCategory.BUSINESS;
-import static org.zalando.nakadi.domain.EventCategory.DATA;
-import static org.zalando.nakadi.utils.TestUtils.buildDefaultEventType;
-import static org.zalando.nakadi.utils.TestUtils.createBatch;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
+import static org.zalando.nakadi.domain.EventCategory.BUSINESS;
+import static org.zalando.nakadi.domain.EventCategory.DATA;
+import static org.zalando.nakadi.utils.TestUtils.buildDefaultEventType;
+import static org.zalando.nakadi.utils.TestUtils.createBatchItem;
 
 public class EnrichmentTest {
     private final EnrichmentsRegistry registry = mock(EnrichmentsRegistry.class);
@@ -59,7 +59,7 @@ public class EnrichmentTest {
         final EventType eventType = buildDefaultEventType();
         eventType.getEnrichmentStrategies().add(EnrichmentStrategyDescriptor.METADATA_ENRICHMENT);
         final JSONObject event = new JSONObject();
-        final BatchItem batchItem = createBatch(event);
+        final BatchItem batchItem = createBatchItem(event);
 
         final EnrichmentStrategy strategy = mock(EnrichmentStrategy.class);
         Mockito

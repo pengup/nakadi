@@ -2,12 +2,13 @@ package org.zalando.nakadi.service.subscription.state;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.zalando.nakadi.service.subscription.KafkaClient;
+import org.zalando.nakadi.domain.NakadiCursor;
 import org.zalando.nakadi.service.subscription.StreamParameters;
 import org.zalando.nakadi.service.subscription.StreamingContext;
 import org.zalando.nakadi.service.subscription.SubscriptionOutput;
 import org.zalando.nakadi.service.subscription.zk.ZkSubscriptionClient;
 
+import java.util.Comparator;
 import java.util.concurrent.TimeUnit;
 
 public abstract class State {
@@ -42,10 +43,6 @@ public abstract class State {
 
     protected ZkSubscriptionClient getZk() {
         return context.getZkClient();
-    }
-
-    protected KafkaClient getKafka() {
-        return context.getKafkaClient();
     }
 
     protected String getSessionId() {
@@ -85,15 +82,11 @@ public abstract class State {
         };
     }
 
-    protected void registerSession() {
-        context.registerSession();
-    }
-
-    protected void unregisterSession() {
-        context.unregisterSession();
-    }
-
     public StreamingContext getContext() {
         return context;
+    }
+
+    public Comparator<NakadiCursor> getComparator() {
+        return getContext().getCursorComparator();
     }
 }

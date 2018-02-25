@@ -4,29 +4,48 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.common.collect.Sets;
+import com.jayway.restassured.RestAssured;
 import com.jayway.restassured.response.Header;
 import com.jayway.restassured.response.Response;
 import org.hamcrest.Matchers;
+import org.junit.Assert;
 import org.junit.Before;
+import org.junit.BeforeClass;
+import org.junit.Ignore;
 import org.junit.Test;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
-import org.zalando.nakadi.domain.Cursor;
+import org.zalando.nakadi.domain.EventType;
+import org.zalando.nakadi.domain.EventTypeStatistics;
 import org.zalando.nakadi.repository.kafka.KafkaTestHelper;
 import org.zalando.nakadi.service.BlacklistService;
+import org.zalando.nakadi.utils.EventTypeTestBuilder;
+import org.zalando.nakadi.utils.TestUtils;
+import org.zalando.nakadi.view.Cursor;
+import org.zalando.nakadi.webservice.utils.NakadiTestUtils;
 
+import javax.servlet.http.HttpServletResponse;
+import java.io.BufferedReader;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.net.HttpURLConnection;
+import java.net.URL;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
+import java.util.stream.IntStream;
 
 import static com.jayway.restassured.RestAssured.given;
 import static java.text.MessageFormat.format;
+import static java.util.stream.IntStream.range;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.hasKey;
 import static org.hamcrest.Matchers.hasSize;
@@ -36,9 +55,13 @@ import static org.junit.Assert.fail;
 public class EventStreamReadingAT extends BaseAT {
 
     private static final String TEST_PARTITION = "0";
+    private static final int PARTITIONS_NUM = 8;
     private static final String DUMMY_EVENT = "Dummy";
-    private static final String STREAM_ENDPOINT = createStreamEndpointUrl(EVENT_TYPE_NAME);
     private static final String SEPARATOR = "\n";
+
+    private static String streamEndpoint;
+    private static String topicName;
+    private static EventType eventType;
 
     private final ObjectMapper jsonMapper = new ObjectMapper();
     private KafkaTestHelper kafkaHelper;
@@ -46,23 +69,34 @@ public class EventStreamReadingAT extends BaseAT {
     private List<Cursor> initialCursors;
     private List<Cursor> kafkaInitialNextOffsets;
 
+    @BeforeClass
+    public static void setupClass() throws JsonProcessingException {
+        eventType = EventTypeTestBuilder.builder()
+                .defaultStatistic(new EventTypeStatistics(PARTITIONS_NUM, PARTITIONS_NUM))
+                .build();
+        NakadiTestUtils.createEventTypeInNakadi(eventType);
+        streamEndpoint = createStreamEndpointUrl(eventType.getName());
+        // expect only one timeline, because we just created event type
+        topicName = BaseAT.TIMELINE_REPOSITORY.listTimelinesOrdered(eventType.getName()).get(0).getTopic();
+    }
+
     @Before
-    public void setUp() throws InterruptedException, JsonProcessingException {
+    public void setUp() throws JsonProcessingException {
         kafkaHelper = new KafkaTestHelper(KAFKA_URL);
-        initialCursors = kafkaHelper.getOffsetsToReadFromLatest(TEST_TOPIC);
-        kafkaInitialNextOffsets = kafkaHelper.getNextOffsets(TEST_TOPIC);
+        initialCursors = kafkaHelper.getOffsetsToReadFromLatest(topicName);
+        kafkaInitialNextOffsets = kafkaHelper.getNextOffsets(topicName);
         xNakadiCursors = jsonMapper.writeValueAsString(initialCursors);
     }
 
     @Test(timeout = 10000)
     @SuppressWarnings("unchecked")
     public void whenPushFewEventsAndReadThenGetEventsInStream()
-            throws ExecutionException, InterruptedException, JsonProcessingException {
+            throws ExecutionException, InterruptedException {
 
         // ARRANGE //
         // push events to one of the partitions
         final int eventsPushed = 2;
-        kafkaHelper.writeMultipleMessageToPartition(TEST_PARTITION, TEST_TOPIC, DUMMY_EVENT, eventsPushed);
+        kafkaHelper.writeMultipleMessageToPartition(TEST_PARTITION, topicName, DUMMY_EVENT, eventsPushed);
 
         // ACT //
         final Response response = readEvents();
@@ -89,7 +123,8 @@ public class EventStreamReadingAT extends BaseAT {
                 .filter(cursor -> TEST_PARTITION.equals(cursor.getPartition()))
                 .findFirst()
                 .orElseThrow(() -> new AssertionError("Failed to find cursor for needed partition"));
-        final String expectedOffset = Long.toString(Long.parseLong(partitionCursor.getOffset()) - 1 + eventsPushed);
+        final String expectedOffset = TestUtils.toTimelineOffset(Long.parseLong(partitionCursor.getOffset()) - 1 +
+                eventsPushed);
 
         // check that batch has offset, partition and events number we expect
         validateBatch(batchToCheck, TEST_PARTITION, expectedOffset, eventsPushed);
@@ -97,12 +132,12 @@ public class EventStreamReadingAT extends BaseAT {
 
     @Test(timeout = 10000)
     public void whenAcceptEncodingGzipReceiveCompressedStream()
-            throws ExecutionException, InterruptedException, JsonProcessingException {
+            throws ExecutionException, InterruptedException {
 
         // ARRANGE //
         // push events to one of the partitions
         final int eventsPushed = 2;
-        kafkaHelper.writeMultipleMessageToPartition(TEST_PARTITION, TEST_TOPIC, DUMMY_EVENT, eventsPushed);
+        kafkaHelper.writeMultipleMessageToPartition(TEST_PARTITION, topicName, DUMMY_EVENT, eventsPushed);
 
         // ACT //
         final Response response = given()
@@ -112,7 +147,7 @@ public class EventStreamReadingAT extends BaseAT {
                 .param("stream_timeout", "2")
                 .param("batch_flush_timeout", "2")
                 .when()
-                .get(STREAM_ENDPOINT);
+                .get(streamEndpoint);
 
         // ASSERT //
         response.then().statusCode(HttpStatus.OK.value()).header(HttpHeaders.TRANSFER_ENCODING, "chunked");
@@ -122,13 +157,13 @@ public class EventStreamReadingAT extends BaseAT {
     @Test(timeout = 10000)
     @SuppressWarnings("unchecked")
     public void whenPushedAmountOfEventsMoreThanBatchSizeAndReadThenGetEventsInMultipleBatches()
-            throws ExecutionException, InterruptedException, JsonProcessingException {
+            throws ExecutionException, InterruptedException {
 
         // ARRANGE //
         // push events to one of the partitions so that they don't fit into one branch
         final int batchLimit = 5;
         final int eventsPushed = 8;
-        kafkaHelper.writeMultipleMessageToPartition(TEST_PARTITION, TEST_TOPIC, DUMMY_EVENT, eventsPushed);
+        kafkaHelper.writeMultipleMessageToPartition(TEST_PARTITION, topicName, DUMMY_EVENT, eventsPushed);
 
         // ACT //
         final Response response = given()
@@ -137,7 +172,7 @@ public class EventStreamReadingAT extends BaseAT {
                 .param("stream_timeout", "2")
                 .param("batch_flush_timeout", "2")
                 .when()
-                .get(STREAM_ENDPOINT);
+                .get(streamEndpoint);
 
         // ASSERT //
         response.then().statusCode(HttpStatus.OK.value()).header(HttpHeaders.TRANSFER_ENCODING, "chunked");
@@ -161,8 +196,10 @@ public class EventStreamReadingAT extends BaseAT {
                 .filter(cursor -> TEST_PARTITION.equals(cursor.getPartition()))
                 .findFirst()
                 .orElseThrow(() -> new AssertionError("Failed to find cursor for needed partition"));
-        final String expectedOffset1 = Long.toString(Long.parseLong(partitionCursor.getOffset()) - 1 + batchLimit);
-        final String expectedOffset2 = Long.toString(Long.parseLong(partitionCursor.getOffset()) - 1 + eventsPushed);
+        final String expectedOffset1 =
+                TestUtils.toTimelineOffset(Long.parseLong(partitionCursor.getOffset()) - 1 + batchLimit);
+        final String expectedOffset2 =
+                TestUtils.toTimelineOffset(Long.parseLong(partitionCursor.getOffset()) - 1 + eventsPushed);
 
         // check that batches have offset, partition and events number we expect
         validateBatch(batchesToCheck.get(0), TEST_PARTITION, expectedOffset1, batchLimit);
@@ -171,8 +208,7 @@ public class EventStreamReadingAT extends BaseAT {
 
     @Test(timeout = 10000)
     @SuppressWarnings("unchecked")
-    public void whenReadFromTheEndThenLatestOffsetsInStream()
-            throws ExecutionException, InterruptedException, JsonProcessingException {
+    public void whenReadFromTheEndThenLatestOffsetsInStream() {
 
         // ACT //
         // just stream without X-nakadi-cursors; that should make nakadi to read from the very end
@@ -180,7 +216,7 @@ public class EventStreamReadingAT extends BaseAT {
                 .param("stream_timeout", "2")
                 .param("batch_flush_timeout", "2")
                 .when()
-                .get(STREAM_ENDPOINT);
+                .get(streamEndpoint);
 
         // ASSERT //
         response.then().statusCode(HttpStatus.OK.value()).header(HttpHeaders.TRANSFER_ENCODING, "chunked");
@@ -205,15 +241,14 @@ public class EventStreamReadingAT extends BaseAT {
 
     @Test(timeout = 10000)
     @SuppressWarnings("unchecked")
-    public void whenReachKeepAliveLimitThenStreamIsClosed()
-            throws ExecutionException, InterruptedException, JsonProcessingException {
+    public void whenReachKeepAliveLimitThenStreamIsClosed() {
         // ACT //
         final int keepAliveLimit = 3;
         final Response response = given()
                 .param("batch_flush_timeout", "1")
                 .param("stream_keep_alive_limit", keepAliveLimit)
                 .when()
-                .get(STREAM_ENDPOINT);
+                .get(streamEndpoint);
 
         // ASSERT //
         response.then().statusCode(HttpStatus.OK.value()).header(HttpHeaders.TRANSFER_ENCODING, "chunked");
@@ -234,7 +269,7 @@ public class EventStreamReadingAT extends BaseAT {
                 .then()
                 .statusCode(HttpStatus.NOT_FOUND.value())
                 .and()
-                .contentType(equalTo("application/problem+json;charset=UTF-8"))
+                .contentType(equalTo("application/problem+json"))
                 .and()
                 .body("detail", equalTo("topic not found"));
     }
@@ -245,11 +280,11 @@ public class EventStreamReadingAT extends BaseAT {
                 .param("batch_limit", "10")
                 .param("stream_limit", "5")
                 .when()
-                .get(STREAM_ENDPOINT)
+                .get(streamEndpoint)
                 .then()
                 .statusCode(HttpStatus.UNPROCESSABLE_ENTITY.value())
                 .and()
-                .contentType(equalTo("application/problem+json;charset=UTF-8"))
+                .contentType(equalTo("application/problem+json"))
                 .and()
                 .body("detail", equalTo("stream_limit can't be lower than batch_limit"));
     }
@@ -260,11 +295,11 @@ public class EventStreamReadingAT extends BaseAT {
                 .param("batch_timeout", "10")
                 .param("stream_timeout", "5")
                 .when()
-                .get(STREAM_ENDPOINT)
+                .get(streamEndpoint)
                 .then()
                 .statusCode(HttpStatus.UNPROCESSABLE_ENTITY.value())
                 .and()
-                .contentType(equalTo("application/problem+json;charset=UTF-8"))
+                .contentType(equalTo("application/problem+json"))
                 .and()
                 .body("detail", equalTo("stream_timeout can't be lower than batch_flush_timeout"));
     }
@@ -274,11 +309,11 @@ public class EventStreamReadingAT extends BaseAT {
         given()
                 .header(new Header("X-nakadi-cursors", "this_is_definitely_not_a_json"))
                 .when()
-                .get(STREAM_ENDPOINT)
+                .get(streamEndpoint)
                 .then()
                 .statusCode(HttpStatus.BAD_REQUEST.value())
                 .and()
-                .contentType(equalTo("application/problem+json;charset=UTF-8"))
+                .contentType(equalTo("application/problem+json"))
                 .and()
                 .body("detail", equalTo("incorrect syntax of X-nakadi-cursors header"));
     }
@@ -288,29 +323,31 @@ public class EventStreamReadingAT extends BaseAT {
         given()
                 .header(new Header("X-nakadi-cursors", "[{\"partition\":\"very_wrong_partition\",\"offset\":\"3\"}]"))
                 .when()
-                .get(STREAM_ENDPOINT)
+                .get(streamEndpoint)
                 .then()
                 .statusCode(HttpStatus.PRECONDITION_FAILED.value())
                 .and()
-                .contentType(equalTo("application/problem+json;charset=UTF-8"))
+                .contentType(equalTo("application/problem+json"))
                 .and()
                 .body("detail", equalTo("non existing partition very_wrong_partition"));
     }
 
     @Test(timeout = 10000)
     public void whenReadEventsForBlockedConsumerThen403() throws Exception {
-
         readEvents()
                 .then()
                 .statusCode(HttpStatus.OK.value());
 
-        SettingsControllerAT.blacklist(EVENT_TYPE_NAME, BlacklistService.Type.CONSUMER_ET);
-        readEvents()
-                .then()
-                .statusCode(403)
-                .body("detail", Matchers.equalTo("Application or event type is blocked"));
+        SettingsControllerAT.blacklist(eventType.getName(), BlacklistService.Type.CONSUMER_ET);
+        try {
+            TestUtils.waitFor(() -> readEvents()
+                    .then()
+                    .statusCode(403)
+                    .body("detail", Matchers.equalTo("Application or event type is blocked")), 1000, 200);
+        } finally {
+            SettingsControllerAT.whitelist(eventType.getName(), BlacklistService.Type.CONSUMER_ET);
+        }
 
-        SettingsControllerAT.whitelist(EVENT_TYPE_NAME, BlacklistService.Type.CONSUMER_ET);
         readEvents()
                 .then()
                 .statusCode(HttpStatus.OK.value());
@@ -323,7 +360,78 @@ public class EventStreamReadingAT extends BaseAT {
                 .param("stream_timeout", "2")
                 .param("batch_flush_timeout", "2")
                 .when()
-                .get(STREAM_ENDPOINT);
+                .get(streamEndpoint);
+    }
+
+    @Ignore
+    @Test(timeout = 10000)
+    public void whenExceedMaxConsumersNumThen429() throws IOException, InterruptedException, ExecutionException {
+        final String etName = NakadiTestUtils.createEventType().getName();
+
+        // try to create 8 consuming connections
+        final List<CompletableFuture<HttpURLConnection>> connectionFutures = range(0, 8)
+                .mapToObj(x -> createConsumingConnection(etName))
+                .collect(Collectors.toList());
+
+        assertThat("first 5 connections should be accepted",
+                countStatusCode(connectionFutures, HttpStatus.OK.value()),
+                equalTo(5));
+
+        assertThat("last 3 connections should be rejected",
+                countStatusCode(connectionFutures, HttpStatus.TOO_MANY_REQUESTS.value()),
+                equalTo(3));
+
+        // close one of open connections
+        for (final CompletableFuture<HttpURLConnection> conn : connectionFutures) {
+            if (conn.get().getResponseCode() == HttpStatus.OK.value()) {
+                conn.get().disconnect();
+                break;
+            }
+        }
+        range(0, 15).forEach(value -> NakadiTestUtils.publishEvent(etName, "{\"foo\": \"bar\"}"));
+
+        // wait for Nakadi to recognize thаt connection is closed
+        Thread.sleep(1000);
+
+        // try to create 3 more connections
+        final List<CompletableFuture<HttpURLConnection>> moreConnectionFutures = range(0, 3)
+                .mapToObj(x -> createConsumingConnection(etName))
+                .collect(Collectors.toList());
+
+        assertThat("one more connection should be accepted",
+                countStatusCode(moreConnectionFutures, HttpStatus.OK.value()),
+                equalTo(1));
+
+        assertThat("other 2 connections should be rejected as we had only one new free slot",
+                countStatusCode(moreConnectionFutures, HttpStatus.TOO_MANY_REQUESTS.value()),
+                equalTo(2));
+    }
+
+    private int countStatusCode(final List<CompletableFuture<HttpURLConnection>> futures, final int statusCode) {
+        return (int) futures.stream()
+                .filter(future -> {
+                    try {
+                        return future.get(5, TimeUnit.SECONDS).getResponseCode() == statusCode;
+                    } catch (Exception e) {
+                        throw new AssertionError("Failed to get future result");
+                    }
+                })
+                .count();
+    }
+
+    private CompletableFuture<HttpURLConnection> createConsumingConnection(final String etName) {
+        final CompletableFuture<HttpURLConnection> future = new CompletableFuture<>();
+        new Thread(() -> {
+            try {
+                final URL url = new URL(URL + createStreamEndpointUrl(etName));
+                final HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+                conn.getResponseCode(); // wait till the response code comes
+                future.complete(conn);
+            } catch (IOException e) {
+                throw new AssertionError();
+            }
+        }).start();
+        return future;
     }
 
     @Test(timeout = 10000)
@@ -332,23 +440,61 @@ public class EventStreamReadingAT extends BaseAT {
         new Thread(() -> {
             try {
                 Thread.sleep(3000);
-                SettingsControllerAT.blacklist(EVENT_TYPE_NAME, BlacklistService.Type.CONSUMER_ET);
+                SettingsControllerAT.blacklist(eventType.getName(), BlacklistService.Type.CONSUMER_ET);
             } catch (final Exception e) {
                 e.printStackTrace();
             }
         }).start();
+        try {
+            // read events from the stream until we are blocked otherwise TestTimedOutException will be thrown and test
+            // is considered to be failed
+            given()
+                    .header(new Header("X-nakadi-cursors", xNakadiCursors))
+                    .param("batch_limit", "1")
+                    .param("stream_timeout", "60")
+                    .param("batch_flush_timeout", "10")
+                    .when()
+                    .get(streamEndpoint);
+        } finally {
+            SettingsControllerAT.whitelist(eventType.getName(), BlacklistService.Type.CONSUMER_ET);
+        }
+    }
 
-        // read events from the stream until we are blocked otherwise TestTimedOutException will be thrown and test
-        // is considered to be failed
-        given()
-                .header(new Header("X-nakadi-cursors", xNakadiCursors))
-                .param("batch_limit", "1")
-                .param("stream_timeout", "60")
-                .param("batch_flush_timeout", "10")
-                .when()
-                .get(STREAM_ENDPOINT);
+    @Test(timeout = 10000)
+    public void whenMemoryOverflowEventsDumped() throws IOException {
+        // Create event type
+        final EventType loadEt = EventTypeTestBuilder.builder()
+                .defaultStatistic(new EventTypeStatistics(PARTITIONS_NUM, PARTITIONS_NUM))
+                .build();
+        NakadiTestUtils.createEventTypeInNakadi(loadEt);
 
-        SettingsControllerAT.whitelist(EVENT_TYPE_NAME, BlacklistService.Type.CONSUMER_ET);
+        // Publish events to event type, that are not fitting memory
+        final String evt = "{\"foo\":\"barbarbar\"}";
+        final int eventCount = 2 * (10000 / evt.length());
+        NakadiTestUtils.publishEvents(loadEt.getName(), eventCount, i -> evt);
+
+        // Configure streaming so it will:(more than 10s and batch_limit
+        // - definitely wait for more than test timeout (10s)
+        // - collect batch, which size is greater than events published to this event type
+        final String url = RestAssured.baseURI + ":" + RestAssured.port + createStreamEndpointUrl(loadEt.getName())
+                + "?batch_limit=" + (10 * eventCount)
+                + "&stream_limit=" + (10 * eventCount)
+                + "&batch_flush_timeout=11"
+                + "&stream_timeout=11";
+        final HttpURLConnection connection = (HttpURLConnection) new URL(url).openConnection();
+        // Start from the begin.
+        connection.setRequestProperty("X-Nakadi-Cursors",
+                "[" + IntStream.range(0, PARTITIONS_NUM)
+                        .mapToObj(i -> "{\"partition\": \"" + i + "\",\"offset\":\"begin\"}")
+                        .collect(Collectors.joining(",")) + "]");
+        Assert.assertEquals(HttpServletResponse.SC_OK, connection.getResponseCode());
+
+        final InputStream inputStream = connection.getInputStream();
+        final BufferedReader reader = new BufferedReader(new InputStreamReader(inputStream));
+
+        final String line = reader.readLine();
+        Assert.assertNotNull(line);
+        // If we read at least one line, than it means, that we were able to read data before test timeout reached.
     }
 
 
@@ -405,8 +551,7 @@ public class EventStreamReadingAT extends BaseAT {
         if (batch.containsKey("events")) {
             final List<String> events = (List<String>) batch.get("events");
             assertThat(events.size(), equalTo(expectedEventNum));
-        }
-        else {
+        } else {
             assertThat(0, equalTo(expectedEventNum));
         }
     }

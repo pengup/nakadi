@@ -1,5 +1,6 @@
 package org.zalando.nakadi.webservice;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.common.base.Charsets;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
@@ -9,14 +10,16 @@ import com.jayway.restassured.response.Header;
 import com.jayway.restassured.specification.RequestSpecification;
 import org.echocat.jomon.runtime.concurrent.RetryForSpecifiedTimeStrategy;
 import org.hamcrest.Matchers;
-import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
+import org.zalando.nakadi.config.JsonConfig;
+import org.zalando.nakadi.domain.EventType;
 import org.zalando.nakadi.domain.StreamMetadata;
 import org.zalando.nakadi.domain.Subscription;
 import org.zalando.nakadi.domain.SubscriptionBase;
-import org.zalando.nakadi.domain.SubscriptionCursor;
 import org.zalando.nakadi.utils.RandomSubscriptionBuilder;
+import org.zalando.nakadi.utils.TestUtils;
+import org.zalando.nakadi.view.SubscriptionCursor;
 import org.zalando.nakadi.webservice.hila.StreamBatch;
 import org.zalando.nakadi.webservice.utils.TestStreamingClient;
 
@@ -47,24 +50,34 @@ public class UserJourneyAT extends RealEnvironmentAT {
 
     private static final String EVENT1 = "{\"foo\":\"" + randomTextString() + "\"}";
     private static final String EVENT2 = "{\"foo\":\"" + randomTextString() + "\"}";
+    private static final ObjectMapper MAPPER = (new JsonConfig()).jacksonObjectMapper();
+    private static final String ENDPOINT = "/event-types";
 
     private String eventTypeName;
 
     private String eventTypeBody;
     private String eventTypeBodyUpdate;
 
+    public static String getEventTypeJsonFromFile(final String resourceName, final String eventTypeName,
+                                                  final String owningApp)
+            throws IOException {
+        final String json = Resources.toString(Resources.getResource(resourceName), Charsets.UTF_8);
+        return json
+                .replace("NAME_PLACEHOLDER", eventTypeName)
+                .replace("OWNING_APP_PLACEHOLDER", owningApp);
+    }
+
     @Before
     public void before() throws IOException {
         eventTypeName = randomValidEventTypeName();
         eventTypeBody = getEventTypeJsonFromFile("sample-event-type.json", eventTypeName, owningApp);
         eventTypeBodyUpdate = getEventTypeJsonFromFile("sample-event-type-update.json", eventTypeName, owningApp);
+        createEventType();
     }
 
     @SuppressWarnings("unchecked")
     @Test(timeout = 15000)
     public void userJourneyM1() throws InterruptedException, IOException {
-        // create event-type
-        createEventType();
 
         // get event type
         jsonRequestSpec()
@@ -92,12 +105,15 @@ public class UserJourneyAT extends RealEnvironmentAT {
                 .body("schema.type[0]", notNullValue())
                 .body("schema.schema[0]", notNullValue());
 
+        final String updateEventTypeBody = getUpdateEventType();
+
         // update event-type
         jsonRequestSpec()
-                .body(eventTypeBodyUpdate)
+                .body(updateEventTypeBody)
                 .when()
                 .put("/event-types/" + eventTypeName)
                 .then()
+                .body(equalTo(""))
                 .statusCode(OK.value());
 
         // Updates should eventually cause a cache invalidation, so we must retry
@@ -124,8 +140,8 @@ public class UserJourneyAT extends RealEnvironmentAT {
                 .then()
                 .statusCode(OK.value())
                 .body("partition", equalTo("0"))
-                .body("oldest_available_offset", equalTo("0"))
-                .body("newest_available_offset", equalTo("1"));
+                .body("oldest_available_offset", equalTo("001-0001-000000000000000000"))
+                .body("newest_available_offset", equalTo("001-0001-000000000000000001"));
 
         // get offsets for all partitions
         jsonRequestSpec()
@@ -146,9 +162,52 @@ public class UserJourneyAT extends RealEnvironmentAT {
                 .get("/event-types/" + eventTypeName + "/events")
                 .then()
                 .statusCode(OK.value())
-                .body(equalTo("{\"cursor\":{\"partition\":\"0\",\"offset\":\"1\"},\"events\":" + "[" + EVENT1 + ","
-                        + EVENT2 + "]}\n"));
+                .body(equalTo("{\"cursor\":{\"partition\":\"0\",\"offset\":\"001-0001-000000000000000001\"}," +
+                        "\"events\":[" + EVENT1 + "," + EVENT2 + "]}\n"));
 
+        // get distance between cursors
+        jsonRequestSpec()
+                .body("[{\"initial_cursor\": {\"partition\": \"0\", \"offset\":\"001-0001-000000000000000000\"}, " +
+                        "\"final_cursor\": {\"partition\": \"0\", \"offset\":\"001-0001-000000000000000001\"}}]")
+                .when()
+                .post("/event-types/" + eventTypeName + "/cursor-distances")
+                .then()
+                .statusCode(OK.value())
+                .body("size()", equalTo(1))
+                .body("initial_cursor[0].offset", equalTo("001-0001-000000000000000000"))
+                .body("final_cursor[0].offset", equalTo("001-0001-000000000000000001"))
+                .body("distance[0]", equalTo(1));
+
+        // navigate between cursors
+        jsonRequestSpec()
+                .body("[{\"partition\": \"0\", \"offset\":\"001-0001-000000000000000000\", \"shift\": 1}, " +
+                        "{\"partition\": \"0\", \"offset\":\"001-0001-000000000000000001\", \"shift\": -1}]")
+                .when()
+                .post("/event-types/" + eventTypeName + "/shifted-cursors")
+                .then()
+                .statusCode(OK.value())
+                .body("size()", equalTo(2))
+                .body("offset[0]", equalTo("001-0001-000000000000000001"))
+                .body("offset[1]", equalTo("001-0001-000000000000000000"));
+
+        // query for lag
+        jsonRequestSpec()
+                .body("[{\"partition\": \"0\", \"offset\":\"001-0001-000000000000000000\"}]")
+                .when()
+                .post("/event-types/" + eventTypeName + "/cursors-lag")
+                .then()
+                .statusCode(OK.value())
+                .body("size()", equalTo(1))
+                .body("newest_available_offset[0]", equalTo("001-0001-000000000000000001"))
+                .body("oldest_available_offset[0]", equalTo("001-0001-000000000000000000"))
+                .body("unconsumed_events[0]", equalTo(1));
+    }
+
+    @Test(timeout = 3000)
+    public void testEventTypeDeletion() {
+        // The reason for separating this test is https://issues.apache.org/jira/browse/KAFKA-2948
+        // If producer was used to publish an event, than it is impossible to delete this event type anymore, cause
+        // producer will not clean up metadata cache, trying to log that everything is very bad.
         // delete event type
         jsonRequestSpec()
                 .when()
@@ -164,13 +223,23 @@ public class UserJourneyAT extends RealEnvironmentAT {
                 .statusCode(NOT_FOUND.value());
     }
 
+    private String getUpdateEventType() throws IOException {
+        final EventType retrievedEventType = MAPPER.readValue(jsonRequestSpec()
+                        .header("accept", "application/json")
+                        .get(ENDPOINT + "/" + eventTypeName)
+                        .getBody()
+                        .asString(),
+                EventType.class);
+
+        final EventType updateEventType = MAPPER.readValue(eventTypeBodyUpdate, EventType.class);
+        updateEventType.getSchema().setCreatedAt(retrievedEventType.getSchema().getCreatedAt());
+        return MAPPER.writer().writeValueAsString(updateEventType);
+    }
+
     @Test(timeout = 15000)
     public void userJourneyHila() throws InterruptedException, IOException {
-        // create event-type and push some events
-        createEventType();
         postEvents(rangeClosed(0, 3)
-                .boxed()
-                .map(x -> "{\"foo\":\"bar" + x + "\"}")
+                .mapToObj(x -> "{\"foo\":\"bar" + x + "\"}")
                 .collect(Collectors.toList())
                 .toArray(new String[4]));
 
@@ -199,8 +268,8 @@ public class UserJourneyAT extends RealEnvironmentAT {
 
         // validate the content of events
         for (int i = 0; i < batches.size(); i++) {
-
-            final SubscriptionCursor cursor = new SubscriptionCursor("0", String.valueOf(i), eventTypeName, "");
+            final SubscriptionCursor cursor = new SubscriptionCursor("0", TestUtils.toTimelineOffset(i),
+                    eventTypeName, "");
             final StreamBatch expectedBatch = new StreamBatch(cursor,
                     ImmutableList.of(ImmutableMap.of("foo", "bar" + i)),
                     i == 0 ? new StreamMetadata("Stream started") : null);
@@ -235,18 +304,13 @@ public class UserJourneyAT extends RealEnvironmentAT {
                 .then()
                 .statusCode(OK.value())
                 .body("items[0].partition", equalTo("0"))
-                .body("items[0].offset", equalTo("3"));
+                .body("items[0].offset", equalTo("001-0001-000000000000000003"));
 
         // delete subscription
         jsonRequestSpec()
                 .delete("/subscriptions/{sid}", subscription.getId())
                 .then()
                 .statusCode(NO_CONTENT.value());
-    }
-
-    @After
-    public void after() {
-        jsonRequestSpec().delete("/event-types/" + eventTypeName);
     }
 
     private void createEventType() {
@@ -272,15 +336,6 @@ public class UserJourneyAT extends RealEnvironmentAT {
         return requestSpec()
                 .header("accept", "application/json")
                 .contentType(JSON);
-    }
-
-    public static String getEventTypeJsonFromFile(final String resourceName, final String eventTypeName,
-                                                  final String owningApp)
-            throws IOException {
-        final String json = Resources.toString(Resources.getResource(resourceName), Charsets.UTF_8);
-        return json
-                .replace("NAME_PLACEHOLDER", eventTypeName)
-                .replace("OWNING_APP_PLACEHOLDER", owningApp);
     }
 
 }

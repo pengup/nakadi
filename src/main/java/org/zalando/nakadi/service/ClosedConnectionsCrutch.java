@@ -14,7 +14,6 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
-import org.zalando.nakadi.util.FeatureToggleService;
 
 import javax.servlet.http.HttpServletRequest;
 import java.io.BufferedReader;
@@ -85,13 +84,15 @@ public class ClosedConnectionsCrutch {
 
         @Override
         public boolean equals(final Object o) {
-            if (this == o) return true;
-            if (o == null || getClass() != o.getClass()) return false;
+            if (this == o) {
+                return true;
+            }
+            if (o == null || getClass() != o.getClass()) {
+                return false;
+            }
 
             final ConnectionInfo that = (ConnectionInfo) o;
-
             return port == that.port && address.equals(that.address);
-
         }
 
         @Override
@@ -191,7 +192,7 @@ public class ClosedConnectionsCrutch {
     @VisibleForTesting
     Map<ConnectionInfo, ConnectionState> getCurrentConnections(final InputStream in) throws IOException {
         final Map<ConnectionInfo, ConnectionState> connectionToState = new HashMap<>();
-        try (final BufferedReader reader = new BufferedReader(new InputStreamReader(in))) {
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(in))) {
             // /proc/net/tcp[6]
             // idx, local_address, remote_address, status, ...
 

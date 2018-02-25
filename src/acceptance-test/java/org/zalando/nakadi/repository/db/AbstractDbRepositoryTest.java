@@ -1,7 +1,5 @@
 package org.zalando.nakadi.repository.db;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
-import org.zalando.nakadi.config.JsonConfig;
 import org.junit.After;
 import org.junit.Before;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -19,34 +17,20 @@ public abstract class AbstractDbRepositoryTest {
 
     protected JdbcTemplate template;
     protected Connection connection;
-    protected ObjectMapper mapper;
-    protected String repositoryTable;
-
-    public AbstractDbRepositoryTest(final String repositoryTable) {
-        this.repositoryTable = repositoryTable;
-    }
 
     @Before
-    public void setUp() {
+    public void setUp() throws Exception {
         try {
-            mapper = (new JsonConfig()).jacksonObjectMapper();
             final DataSource datasource = new DriverManagerDataSource(POSTGRES_URL, POSTGRES_USER, POSTGRES_PWD);
             template = new JdbcTemplate(datasource);
             connection = datasource.getConnection();
-            clearRepositoryTable();
-        } catch (SQLException e) {
+        } catch (final SQLException e) {
             e.printStackTrace();
         }
     }
 
     @After
     public void tearDown() throws SQLException {
-        clearRepositoryTable();
         connection.close();
     }
-
-    private void clearRepositoryTable() {
-        template.execute("DELETE FROM " + repositoryTable);
-    }
-
 }

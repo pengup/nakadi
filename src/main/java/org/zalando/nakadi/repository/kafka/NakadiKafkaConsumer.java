@@ -1,61 +1,67 @@
 package org.zalando.nakadi.repository.kafka;
 
-import com.google.common.collect.Lists;
-import org.zalando.nakadi.domain.ConsumedEvent;
-import org.zalando.nakadi.domain.Cursor;
-import org.zalando.nakadi.repository.EventConsumer;
 import org.apache.kafka.clients.consumer.Consumer;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.common.TopicPartition;
+import org.zalando.nakadi.domain.ConsumedEvent;
+import org.zalando.nakadi.domain.Timeline;
+import org.zalando.nakadi.repository.EventConsumer;
 
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
-import java.util.Optional;
-import java.util.Queue;
+import java.util.Map;
+import java.util.Set;
 import java.util.stream.Collectors;
-import java.util.stream.StreamSupport;
 
-import static org.zalando.nakadi.repository.kafka.KafkaCursor.kafkaCursor;
+public class NakadiKafkaConsumer implements EventConsumer.LowLevelConsumer {
 
-public class NakadiKafkaConsumer implements EventConsumer {
-
-    private final Consumer<String, String> kafkaConsumer;
-
-    private Queue<ConsumedEvent> eventQueue;
-
+    private final Consumer<byte[], byte[]> kafkaConsumer;
     private final long pollTimeout;
+    private final Map<TopicPartition, Timeline> timelineMap;
 
-    public NakadiKafkaConsumer(final Consumer<String, String> kafkaConsumer, final String topic,
-                               final List<KafkaCursor> kafkaCursors, final long pollTimeout) {
-        eventQueue = Lists.newLinkedList();
+    public NakadiKafkaConsumer(
+            final Consumer<byte[], byte[]> kafkaConsumer,
+            final List<KafkaCursor> kafkaCursors,
+            final Map<TopicPartition, Timeline> timelineMap,
+            final long pollTimeout) {
         this.kafkaConsumer = kafkaConsumer;
         this.pollTimeout = pollTimeout;
-
+        this.timelineMap = timelineMap;
         // define topic/partitions to consume from
-        final List<TopicPartition> topicPartitions = kafkaCursors
-                .stream()
-                .map(cursor -> new TopicPartition(topic, cursor.getPartition()))
-                .collect(Collectors.toList());
-        kafkaConsumer.assign(topicPartitions);
-
-        // set offsets
-        topicPartitions.forEach(topicPartition ->
-                kafkaConsumer.seek(
-                        topicPartition,
-                        kafkaCursors
-                                .stream()
-                                .filter(cursor -> cursor.getPartition() == topicPartition.partition())
-                                .findFirst()
-                                .get()
-                                .getOffset()
+        final Map<TopicPartition, KafkaCursor> topicCursors = kafkaCursors.stream().collect(
+                Collectors.toMap(
+                        cursor -> new TopicPartition(cursor.getTopic(), cursor.getPartition()),
+                        cursor -> cursor,
+                        (cursor1, cursor2) -> cursor2
                 ));
+        kafkaConsumer.assign(new ArrayList<>(topicCursors.keySet()));
+        topicCursors.forEach((topicPartition, cursor) -> kafkaConsumer.seek(topicPartition, cursor.getOffset()));
     }
 
     @Override
-    public Optional<ConsumedEvent> readEvent() {
-        if (eventQueue.isEmpty()) {
-            pollFromKafka();
+    public Set<org.zalando.nakadi.domain.TopicPartition> getAssignment() {
+        return kafkaConsumer.assignment().stream()
+                .map(tp -> new org.zalando.nakadi.domain.TopicPartition(
+                        tp.topic(),
+                        KafkaCursor.toNakadiPartition(tp.partition())))
+                .collect(Collectors.toSet());
+    }
+
+    @Override
+    public List<ConsumedEvent> readEvents() {
+        final ConsumerRecords<byte[], byte[]> records = kafkaConsumer.poll(pollTimeout);
+        if (records.isEmpty()) {
+            return Collections.emptyList();
         }
-        return Optional.ofNullable(eventQueue.poll());
+        final ArrayList<ConsumedEvent> result = new ArrayList<>(records.count());
+        for (final ConsumerRecord<byte[], byte[]> record : records) {
+            final KafkaCursor cursor = new KafkaCursor(record.topic(), record.partition(), record.offset());
+            final Timeline timeline = timelineMap.get(new TopicPartition(record.topic(), record.partition()));
+            result.add(new ConsumedEvent(record.value(), cursor.toNakadiCursor(timeline)));
+        }
+        return result;
     }
 
     @Override
@@ -63,15 +69,4 @@ public class NakadiKafkaConsumer implements EventConsumer {
         kafkaConsumer.close();
     }
 
-    private void pollFromKafka() {
-        final ConsumerRecords<String, String> records = kafkaConsumer.poll(pollTimeout);
-        eventQueue = StreamSupport
-                .stream(records.spliterator(), false)
-                .map(record -> {
-                    final Cursor cursor = kafkaCursor(record.partition(), record.offset()).asNakadiCursor();
-                    return new ConsumedEvent(record.value(), record.topic(), cursor.getPartition(),
-                            cursor.getOffset());
-                })
-                .collect(Collectors.toCollection(Lists::newLinkedList));
-    }
 }

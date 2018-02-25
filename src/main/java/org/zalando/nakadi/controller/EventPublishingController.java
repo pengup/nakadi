@@ -1,10 +1,12 @@
 package org.zalando.nakadi.controller;
 
-import org.json.JSONArray;
+import com.google.common.base.Charsets;
 import org.json.JSONException;
+import org.json.JSONObject;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -13,18 +15,24 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.context.request.NativeWebRequest;
 import org.zalando.nakadi.domain.EventPublishResult;
+import org.zalando.nakadi.domain.EventPublishingStatus;
 import org.zalando.nakadi.exceptions.NakadiException;
 import org.zalando.nakadi.exceptions.NoSuchEventTypeException;
+import org.zalando.nakadi.exceptions.runtime.AccessDeniedException;
+import org.zalando.nakadi.exceptions.runtime.ServiceTemporarilyUnavailableException;
 import org.zalando.nakadi.metrics.EventTypeMetricRegistry;
 import org.zalando.nakadi.metrics.EventTypeMetrics;
 import org.zalando.nakadi.security.Client;
-import org.zalando.nakadi.service.EventPublisher;
 import org.zalando.nakadi.service.BlacklistService;
+import org.zalando.nakadi.service.EventPublisher;
+import org.zalando.nakadi.service.NakadiKpiPublisher;
 import org.zalando.problem.Problem;
 import org.zalando.problem.ThrowableProblem;
 import org.zalando.problem.spring.web.advice.Responses;
 
 import javax.ws.rs.core.Response;
+import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
 
 import static org.springframework.http.ResponseEntity.status;
 import static org.springframework.web.bind.annotation.RequestMethod.POST;
@@ -38,21 +46,28 @@ public class EventPublishingController {
     private final EventPublisher publisher;
     private final EventTypeMetricRegistry eventTypeMetricRegistry;
     private final BlacklistService blacklistService;
+    private final NakadiKpiPublisher nakadiKpiPublisher;
+    private final String kpiBatchPublishedEventType;
 
     @Autowired
     public EventPublishingController(final EventPublisher publisher,
                                      final EventTypeMetricRegistry eventTypeMetricRegistry,
-                                     final BlacklistService blacklistService) {
+                                     final BlacklistService blacklistService,
+                                     final NakadiKpiPublisher nakadiKpiPublisher,
+                                     @Value("${nakadi.kpi.event-types.nakadiBatchPublished}")
+                                         final String kpiBatchPublishedEventType) {
         this.publisher = publisher;
         this.eventTypeMetricRegistry = eventTypeMetricRegistry;
         this.blacklistService = blacklistService;
+        this.nakadiKpiPublisher = nakadiKpiPublisher;
+        this.kpiBatchPublishedEventType = kpiBatchPublishedEventType;
     }
 
     @RequestMapping(value = "/event-types/{eventTypeName}/events", method = POST)
     public ResponseEntity postEvent(@PathVariable final String eventTypeName,
                                     @RequestBody final String eventsAsString,
                                     final NativeWebRequest request,
-                                    final Client client) {
+                                    final Client client) throws AccessDeniedException {
         LOG.trace("Received event {} for event type {}", eventsAsString, eventTypeName);
         final EventTypeMetrics eventTypeMetrics = eventTypeMetricRegistry.metricsFor(eventTypeName);
 
@@ -66,7 +81,7 @@ public class EventPublishingController {
                     request, eventTypeMetrics, client);
             eventTypeMetrics.incrementResponseCount(response.getStatusCode().value());
             return response;
-        } catch (RuntimeException ex) {
+        } catch (final RuntimeException ex) {
             eventTypeMetrics.incrementResponseCount(Response.Status.INTERNAL_SERVER_ERROR.getStatusCode());
             throw ex;
         }
@@ -76,15 +91,19 @@ public class EventPublishingController {
                                              final String eventsAsString,
                                              final NativeWebRequest nativeWebRequest,
                                              final EventTypeMetrics eventTypeMetrics,
-                                             final Client client) {
+                                             final Client client)
+            throws AccessDeniedException, ServiceTemporarilyUnavailableException {
         final long startingNanos = System.nanoTime();
         try {
-            final JSONArray eventsAsJsonObjects = new JSONArray(eventsAsString);
+            final EventPublishResult result = publisher.publish(eventsAsString, eventTypeName, client);
 
-            final int eventCount = eventsAsJsonObjects.length();
-            eventTypeMetrics.reportSizing(eventCount, eventsAsString.length());
+            final int eventCount = result.getResponses().size();
+            final int totalSizeBytes = eventsAsString.getBytes(Charsets.UTF_8).length;
 
-            return response(publisher.publish(eventsAsJsonObjects, eventTypeName, client));
+            reportMetrics(eventTypeMetrics, result, totalSizeBytes, eventCount);
+            reportSLOs(startingNanos, totalSizeBytes, eventCount, result, eventTypeName, client);
+
+            return response(result);
         } catch (final JSONException e) {
             LOG.debug("Problem parsing event", e);
             return processJSONException(e, nativeWebRequest);
@@ -96,6 +115,42 @@ public class EventPublishingController {
             return create(e.asProblem(), nativeWebRequest);
         } finally {
             eventTypeMetrics.updateTiming(startingNanos, System.nanoTime());
+        }
+    }
+
+    private void reportSLOs(final long startingNanos, final int totalSizeBytes, final int eventCount,
+                            final EventPublishResult eventPublishResult, final String eventTypeName,
+                            final Client client) {
+        if (eventPublishResult.getStatus() == EventPublishingStatus.SUBMITTED) {
+            final long msSpent = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startingNanos);
+            final String applicationName = client.getClientId();
+
+            LOG.info("[SLO] [publishing-latency] time={} size={} count={} eventTypeName={} app={}", msSpent,
+                    totalSizeBytes, eventCount, eventTypeName, applicationName);
+
+            nakadiKpiPublisher.publish(kpiBatchPublishedEventType, () -> new JSONObject()
+                    .put("event_type", eventTypeName)
+                    .put("app", applicationName)
+                    .put("app_hashed", nakadiKpiPublisher.hash(applicationName))
+                    .put("token_realm", client.getRealm())
+                    .put("number_of_events", eventCount)
+                    .put("ms_spent", msSpent)
+                    .put("batch_size", totalSizeBytes));
+        }
+    }
+
+    private void reportMetrics(final EventTypeMetrics eventTypeMetrics, final EventPublishResult result,
+                               final int totalSizeBytes, final int eventCount) {
+        if (result.getStatus() == EventPublishingStatus.SUBMITTED) {
+            eventTypeMetrics.reportSizing(eventCount, totalSizeBytes - eventCount - 1);
+        } else if (result.getStatus() == EventPublishingStatus.FAILED && eventCount != 0) {
+            final int successfulEvents = result.getResponses()
+                    .stream()
+                    .filter(r -> r.getPublishingStatus() == EventPublishingStatus.SUBMITTED)
+                    .collect(Collectors.toList())
+                    .size();
+            final double avgEventSize = totalSizeBytes / (double) eventCount;
+            eventTypeMetrics.reportSizing(successfulEvents, (int) Math.round(avgEventSize * successfulEvents));
         }
     }
 

@@ -1,12 +1,15 @@
 package org.zalando.nakadi.repository.kafka;
 
-import org.zalando.nakadi.domain.Cursor;
 import kafka.admin.AdminUtils;
+import kafka.admin.RackAwareMode;
+import kafka.server.ConfigType;
 import kafka.utils.ZkUtils;
+import org.apache.commons.lang3.StringUtils;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.common.TopicPartition;
+import org.zalando.nakadi.view.Cursor;
 
 import java.util.List;
 import java.util.Properties;
@@ -18,6 +21,7 @@ import static org.zalando.nakadi.repository.kafka.KafkaCursor.toNakadiOffset;
 
 public class KafkaTestHelper {
 
+    public static final int CURSOR_OFFSET_LENGTH = 18;
     private final String kafkaUrl;
 
     public KafkaTestHelper(final String kafkaUrl) {
@@ -63,11 +67,13 @@ public class KafkaTestHelper {
                 .stream()
                 .map(cursor -> {
                     if ("0".equals(cursor.getOffset())) {
-                        return new Cursor(cursor.getPartition(), Cursor.BEFORE_OLDEST_OFFSET);
+                        return new Cursor(cursor.getPartition(), "001-0001--1");
                     }
                     else {
                         final long lastEventOffset = toKafkaOffset(cursor.getOffset()) - 1;
-                        return new Cursor(cursor.getPartition(), toNakadiOffset(lastEventOffset));
+                        final String offset = StringUtils.leftPad(toNakadiOffset(lastEventOffset),
+                                CURSOR_OFFSET_LENGTH, '0');
+                        return new Cursor(cursor.getPartition(), String.format("001-0001-%s", offset));
                     }
                 })
                 .collect(Collectors.toList());
@@ -83,7 +89,7 @@ public class KafkaTestHelper {
                 .collect(Collectors.toList());
 
         consumer.assign(partitions);
-        consumer.seekToEnd(partitions.toArray(new TopicPartition[partitions.size()]));
+        consumer.seekToEnd(partitions);
 
         return partitions
                 .stream()
@@ -96,12 +102,18 @@ public class KafkaTestHelper {
         ZkUtils zkUtils = null;
         try {
             zkUtils = ZkUtils.apply(zkUrl, 30000, 10000, false);
-            AdminUtils.createTopic(zkUtils, topic, 1, 1, new Properties());
+            AdminUtils.createTopic(zkUtils, topic, 1, 1, new Properties(), RackAwareMode.Safe$.MODULE$);
         }
         finally {
             if (zkUtils != null) {
                 zkUtils.close();
             }
         }
+    }
+
+    public static Long getTopicRetentionTime(final String topic, final String zkPath) {
+        final ZkUtils zkUtils = ZkUtils.apply(zkPath, 30000, 10000, false);
+        final Properties topicConfig = AdminUtils.fetchEntityConfig(zkUtils, ConfigType.Topic(), topic);
+        return Long.valueOf(topicConfig.getProperty("retention.ms"));
     }
 }

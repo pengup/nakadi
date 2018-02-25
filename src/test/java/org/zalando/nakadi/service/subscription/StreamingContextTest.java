@@ -1,11 +1,16 @@
 package org.zalando.nakadi.service.subscription;
 
 import org.junit.Assert;
+import org.junit.Ignore;
 import org.junit.Test;
+import org.mockito.Mockito;
 import org.zalando.nakadi.service.subscription.model.Session;
+import org.zalando.nakadi.service.subscription.state.CleanupState;
+import org.zalando.nakadi.service.subscription.state.DummyState;
 import org.zalando.nakadi.service.subscription.state.State;
 
 import java.io.IOException;
+import java.io.OutputStream;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
@@ -25,8 +30,8 @@ public class StreamingContextTest {
             }
 
             @Override
-            public void streamData(final byte[] data) throws IOException {
-
+            public OutputStream getOutputStream() {
+                return null;
             }
         };
         return new StreamingContext.Builder()
@@ -35,12 +40,10 @@ public class StreamingContextTest {
                 .setSession(Session.generate(1))
                 .setTimer(null)
                 .setZkClient(null)
-                .setKafkaClient(null)
                 .setRebalancer(null)
                 .setKafkaPollTimeout(0)
                 .setLoggingPath("stream")
                 .setConnectionReady(new AtomicBoolean(true))
-                .setEventTypesForTopics(null)
                 .setCursorTokenService(null)
                 .setObjectMapper(null)
                 .setBlacklistService(null)
@@ -125,5 +128,30 @@ public class StreamingContextTest {
         Assert.assertArrayEquals(new boolean[]{true, true}, onEnterCalls);
         // Check that onExit called even if onEnter throws exception.
         Assert.assertArrayEquals(new boolean[]{true, true}, onExitCalls);
+    }
+
+    @Test
+    @Ignore
+    public void testOnNodeShutdown() throws Exception {
+        final StreamingContext ctxSpy = Mockito.spy(createTestContext(null));
+        final Thread t = new Thread(() -> {
+            try {
+                ctxSpy.streamInternal(new State() {
+                    @Override
+                    public void onEnter() {
+                    }
+                });
+            } catch (final InterruptedException ignore) {
+            }
+        });
+        t.start();
+        t.join(1000);
+
+        new Thread(() -> ctxSpy.onNodeShutdown()).start();
+        Thread.sleep(2000);
+
+        Mockito.verify(ctxSpy).switchState(Mockito.isA(CleanupState.class));
+        Mockito.verify(ctxSpy).unregisterSession();
+        Mockito.verify(ctxSpy).switchState(Mockito.isA(DummyState.class));
     }
 }

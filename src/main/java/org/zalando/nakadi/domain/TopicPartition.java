@@ -1,59 +1,24 @@
 package org.zalando.nakadi.domain;
 
-import com.fasterxml.jackson.annotation.JsonIgnore;
-import com.fasterxml.jackson.annotation.JsonProperty;
+import javax.annotation.concurrent.Immutable;
+import java.util.Objects;
 
+@Immutable
 public class TopicPartition {
-    @JsonIgnore
-    private String topicId;
-    @JsonProperty("partition")
-    private String partitionId;
-    private String oldestAvailableOffset;
-    private String newestAvailableOffset;
+    private final String topic;
+    private final String partition;
 
-    public TopicPartition(final String topicId, final String partitionId) {
-        setTopicId(topicId);
-        setPartitionId(partitionId);
+    public TopicPartition(final String topic, final String partition) {
+        this.topic = topic;
+        this.partition = partition;
     }
 
-    public TopicPartition(final String topicId, final String partitionId, final String oldestAvailableOffset,
-                          final String newestAvailableOffset) {
-        this.topicId = topicId;
-        this.partitionId = partitionId;
-        this.oldestAvailableOffset = oldestAvailableOffset;
-        this.newestAvailableOffset = newestAvailableOffset;
+    public String getTopic() {
+        return topic;
     }
 
-    public String getTopicId() {
-        return topicId;
-    }
-
-    public void setTopicId(final String topicId) {
-        this.topicId = topicId;
-    }
-
-    public String getPartitionId() {
-        return partitionId;
-    }
-
-    public void setPartitionId(final String partitionId) {
-        this.partitionId = partitionId;
-    }
-
-    public String getOldestAvailableOffset() {
-        return oldestAvailableOffset;
-    }
-
-    public void setOldestAvailableOffset(final String oldestAvailableOffset) {
-        this.oldestAvailableOffset = oldestAvailableOffset;
-    }
-
-    public String getNewestAvailableOffset() {
-        return newestAvailableOffset;
-    }
-
-    public void setNewestAvailableOffset(final String newestAvailableOffset) {
-        this.newestAvailableOffset = newestAvailableOffset;
+    public String getPartition() {
+        return partition;
     }
 
     @Override
@@ -61,47 +26,23 @@ public class TopicPartition {
         if (this == o) {
             return true;
         }
-
-        if (o == null || getClass() != o.getClass()) {
+        if (!(o instanceof TopicPartition)) {
             return false;
         }
-
         final TopicPartition that = (TopicPartition) o;
-
-        if (topicId != null ? !topicId.equals(that.topicId) : that.topicId != null) {
-            return false;
-        }
-
-        if (partitionId != null ? !partitionId.equals(that.partitionId) : that.partitionId != null) {
-            return false;
-        }
-
-        if (oldestAvailableOffset != null ? !oldestAvailableOffset.equals(that.oldestAvailableOffset)
-                                          : that.oldestAvailableOffset != null) {
-            return false;
-        }
-
-        return newestAvailableOffset != null ? newestAvailableOffset.equals(that.newestAvailableOffset)
-                                             : that.newestAvailableOffset == null;
-
+        return Objects.equals(topic, that.topic) && Objects.equals(partition, that.partition);
     }
 
     @Override
     public int hashCode() {
-        int result = topicId != null ? topicId.hashCode() : 0;
-        result = 31 * result + (partitionId != null ? partitionId.hashCode() : 0);
-        result = 31 * result + (oldestAvailableOffset != null ? oldestAvailableOffset.hashCode() : 0);
-        result = 31 * result + (newestAvailableOffset != null ? newestAvailableOffset.hashCode() : 0);
-        return result;
+        return Objects.hash(topic, partition);
     }
 
     @Override
     public String toString() {
         return "TopicPartition{" +
-                "topicId='" + topicId + '\'' +
-                ", partitionId='" + partitionId + '\'' +
-                ", oldestAvailableOffset='" + oldestAvailableOffset + '\'' +
-                ", newestAvailableOffset='" + newestAvailableOffset + '\'' +
+                "topic='" + topic + '\'' +
+                ", partition='" + partition + '\'' +
                 '}';
     }
 }

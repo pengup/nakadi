@@ -1,8 +1,8 @@
 package org.zalando.nakadi.domain;
 
-import java.util.Objects;
 import javax.validation.constraints.Min;
 import javax.validation.constraints.NotNull;
+import java.util.Objects;
 
 public class EventTypeStatistics {
     @NotNull
@@ -50,10 +50,24 @@ public class EventTypeStatistics {
         this.writeParallelism = writeParallelism;
     }
 
+    public EventTypeStatistics() {
+    }
+
+    public EventTypeStatistics(final int readParallelism, final int writeParallelism) {
+        this.readParallelism = readParallelism;
+        this.writeParallelism = writeParallelism;
+        this.messageSize = 1;
+        this.messagesPerMinute = 1;
+    }
+
     @Override
     public boolean equals(final Object o) {
-        if (this == o) return true;
-        if (o == null || getClass() != o.getClass()) return false;
+        if (this == o) {
+            return true;
+        }
+        if (o == null || getClass() != o.getClass()) {
+            return false;
+        }
 
         final EventTypeStatistics that = (EventTypeStatistics) o;
         return Objects.equals(messagesPerMinute, that.messagesPerMinute)

@@ -1,8 +1,8 @@
 package org.zalando.nakadi.partitioning;
 
+import org.json.JSONObject;
 import org.zalando.nakadi.domain.EventType;
 import org.zalando.nakadi.exceptions.PartitioningException;
-import org.json.JSONObject;
 
 import java.util.List;
 
@@ -13,6 +13,6 @@ public interface PartitionStrategy {
     String USER_DEFINED_STRATEGY = "user_defined";
     String RANDOM_STRATEGY = "random";
 
-    String calculatePartition(final EventType eventType, final JSONObject event, final List<String> partitions)
+    String calculatePartition(EventType eventType, JSONObject event, List<String> partitions)
             throws PartitioningException;
 }

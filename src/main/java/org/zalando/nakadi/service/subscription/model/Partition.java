@@ -1,50 +1,14 @@
 package org.zalando.nakadi.service.subscription.model;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
+import com.fasterxml.jackson.annotation.JsonProperty;
+import org.zalando.nakadi.domain.EventTypePartition;
+
 import javax.annotation.Nullable;
 import java.util.Collection;
+import java.util.Objects;
 
 public class Partition {
-    public static class PartitionKey {
-        private final String topic;
-
-        private final String partition;
-
-        public PartitionKey(final String topic, final String partition) {
-            this.topic = topic;
-            this.partition = partition;
-        }
-
-        @Override
-        public boolean equals(final Object o) {
-            if (this == o) return true;
-            if (o == null || getClass() != o.getClass()) return false;
-
-            final PartitionKey that = (PartitionKey) o;
-
-            return topic.equals(that.topic) && partition.equals(that.partition);
-        }
-
-        @Override
-        public int hashCode() {
-            int result = topic.hashCode();
-            result = 31 * result + partition.hashCode();
-            return result;
-        }
-
-        @Override
-        public String toString() {
-            return "{" + topic + ':' + partition + '}';
-        }
-
-        public String getTopic() {
-            return topic;
-        }
-
-        public String getPartition() {
-            return partition;
-        }
-    }
-
     public enum State {
         UNASSIGNED("unassigned"),
         REASSIGNING("reassigning"),
@@ -61,26 +25,42 @@ public class Partition {
         }
     }
 
-    private final PartitionKey key;
-    private final String session;
-    private final String nextSession;
-    private final State state;
+    @JsonProperty("event_type")
+    private String eventType;
+    @JsonProperty("partition")
+    private String partition;
+    @JsonProperty("session")
+    private String session;
+    @JsonProperty("next_session")
+    private String nextSession;
+    @JsonProperty("state")
+    private State state;
 
-    public Partition(final PartitionKey key, @Nullable final String session, @Nullable final String nextSession,
-                     final State state) {
-        this.key = key;
+    public Partition() {
+    }
+
+    public Partition(
+            final String eventType,
+            final String partition,
+            @Nullable final String session,
+            @Nullable final String nextSession,
+            final State state) {
+        this.eventType = eventType;
+        this.partition = partition;
         this.session = session;
         this.nextSession = nextSession;
         this.state = state;
     }
 
     public Partition toState(final State state, @Nullable final String session, @Nullable final String nextSession) {
-        return new Partition(key, session, nextSession, state);
+        return new Partition(eventType, partition, session, nextSession, state);
     }
 
     /**
      * Creates new Partition object that must be moved to session with id {@code sessionId}.
-     * @param sessionId Session id to move to. It must be guaranteed that existingSessionIds do not contain sessionId.
+     *
+     * @param sessionId          Session id to move to. It must be guaranteed that existingSessionIds do not contain
+     *                           sessionId.
      * @param existingSessionIds List of currently available session ids.
      * @return new Partition object with changed sessionId, nextSessionId, state values.
      */
@@ -116,8 +96,17 @@ public class Partition {
 
     }
 
-    public PartitionKey getKey() {
-        return key;
+    @JsonIgnore
+    public EventTypePartition getKey() {
+        return new EventTypePartition(eventType, partition);
+    }
+
+    public String getEventType() {
+        return eventType;
+    }
+
+    public String getPartition() {
+        return partition;
     }
 
     public State getState() {
@@ -135,6 +124,7 @@ public class Partition {
     }
 
     @Nullable
+    @JsonIgnore
     public String getSessionOrNextSession() {
         if (state == State.REASSIGNING) {
             return nextSession;
@@ -144,6 +134,28 @@ public class Partition {
 
     @Override
     public String toString() {
-        return key + "->" + state + ":" + session + "->" + nextSession;
+        return eventType + ":" + partition + "->" + state + ":" + session + "->" + nextSession;
+    }
+
+    @Override
+    public boolean equals(final Object o) {
+        if (this == o) {
+            return true;
+        }
+        if (o == null || getClass() != o.getClass()) {
+            return false;
+        }
+        final Partition partition1 = (Partition) o;
+        return Objects.equals(eventType, partition1.eventType) &&
+                Objects.equals(partition, partition1.partition) &&
+                Objects.equals(session, partition1.session) &&
+                Objects.equals(nextSession, partition1.nextSession) &&
+                state == partition1.state;
+    }
+
+    @Override
+    public int hashCode() {
+
+        return Objects.hash(eventType, partition);
     }
 }

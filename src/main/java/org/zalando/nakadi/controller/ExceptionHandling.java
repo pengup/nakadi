@@ -10,15 +10,27 @@ import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.web.bind.annotation.ControllerAdvice;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.context.request.NativeWebRequest;
-import org.zalando.nakadi.exceptions.NakadiRuntimeException;
 import org.zalando.nakadi.exceptions.IllegalClientIdException;
-import org.zalando.nakadi.exceptions.IllegalScopeException;
 import org.zalando.nakadi.exceptions.NakadiException;
+import org.zalando.nakadi.exceptions.NakadiRuntimeException;
+import org.zalando.nakadi.exceptions.TimelineException;
+import org.zalando.nakadi.exceptions.TopicCreationException;
+import org.zalando.nakadi.exceptions.runtime.AccessDeniedException;
+import org.zalando.nakadi.exceptions.runtime.CursorConversionException;
+import org.zalando.nakadi.exceptions.runtime.CursorsAreEmptyException;
+import org.zalando.nakadi.exceptions.runtime.DbWriteOperationsBlockedException;
+import org.zalando.nakadi.exceptions.runtime.MyNakadiRuntimeException1;
+import org.zalando.nakadi.exceptions.runtime.NoEventTypeException;
+import org.zalando.nakadi.exceptions.runtime.RepositoryProblemException;
+import org.zalando.nakadi.exceptions.runtime.ServiceTemporarilyUnavailableException;
+import org.zalando.problem.MoreStatus;
 import org.zalando.problem.Problem;
 import org.zalando.problem.spring.web.advice.ProblemHandling;
 import org.zalando.problem.spring.web.advice.Responses;
 
 import javax.ws.rs.core.Response;
+
+import static org.zalando.problem.MoreStatus.UNPROCESSABLE_ENTITY;
 
 
 @ControllerAdvice
@@ -62,10 +74,16 @@ public final class ExceptionHandling implements ProblemHandling {
         return Responses.create(Response.Status.BAD_REQUEST, message, request);
     }
 
-    @ExceptionHandler(IllegalScopeException.class)
-    public ResponseEntity<Problem> handleIllegalScopeException(final IllegalScopeException exception,
-                                                               final NativeWebRequest request) {
-        return Responses.create(Response.Status.FORBIDDEN, exception.getMessage(), request);
+    @ExceptionHandler(NoEventTypeException.class)
+    public ResponseEntity<Problem> noEventTypeException(final NoEventTypeException exception,
+                                                        final NativeWebRequest request) {
+        return Responses.create(Response.Status.NOT_FOUND, exception.getMessage(), request);
+    }
+
+    @ExceptionHandler(AccessDeniedException.class)
+    public ResponseEntity<Problem> accessDeniedException(final AccessDeniedException exception,
+                                                         final NativeWebRequest request) {
+        return Responses.create(Response.Status.FORBIDDEN, exception.explain(), request);
     }
 
     @ExceptionHandler(IllegalClientIdException.class)
@@ -74,10 +92,16 @@ public final class ExceptionHandling implements ProblemHandling {
         return Responses.create(Response.Status.FORBIDDEN, exception.getMessage(), request);
     }
 
+    @ExceptionHandler(CursorsAreEmptyException.class)
+    public ResponseEntity<Problem> handleCursorsUnavailableException(final RuntimeException ex,
+                                                                     final NativeWebRequest request) {
+        LOG.debug(ex.getMessage(), ex);
+        return Responses.create(MoreStatus.UNPROCESSABLE_ENTITY, ex.getMessage(), request);
+    }
+
     @ExceptionHandler
     public ResponseEntity<Problem> handleExceptionWrapper(final NakadiRuntimeException exception,
-                                                          final NativeWebRequest request) throws Exception
-    {
+                                                          final NativeWebRequest request) throws Exception {
         final Throwable cause = exception.getCause();
         if (cause instanceof NakadiException) {
             final NakadiException ne = (NakadiException) cause;
@@ -85,4 +109,60 @@ public final class ExceptionHandling implements ProblemHandling {
         }
         throw exception.getException();
     }
+
+    @ExceptionHandler(RepositoryProblemException.class)
+    public ResponseEntity<Problem> handleRepositoryProblem(final RepositoryProblemException exception,
+                                                           final NativeWebRequest request) {
+        LOG.error("Repository problem occurred", exception);
+        return Responses.create(Response.Status.SERVICE_UNAVAILABLE, exception.getMessage(), request);
+    }
+
+    @ExceptionHandler(MyNakadiRuntimeException1.class)
+    public ResponseEntity<Problem> handleInternalError(final MyNakadiRuntimeException1 exception,
+                                                       final NativeWebRequest request) {
+        LOG.error("Unexpected problem occurred", exception);
+        return Responses.create(Response.Status.INTERNAL_SERVER_ERROR, exception.getMessage(), request);
+    }
+
+    @ExceptionHandler(TimelineException.class)
+    public ResponseEntity<Problem> handleTimelineException(final TimelineException exception,
+                                                           final NativeWebRequest request) {
+        LOG.error(exception.getMessage(), exception);
+        final Throwable cause = exception.getCause();
+        if (cause instanceof NakadiException) {
+            final NakadiException ne = (NakadiException) cause;
+            return Responses.create(ne.asProblem(), request);
+        }
+        return Responses.create(Response.Status.SERVICE_UNAVAILABLE, exception.getMessage(), request);
+    }
+
+    @ExceptionHandler(TopicCreationException.class)
+    public ResponseEntity<Problem> handleTopicCreationException(final TopicCreationException exception,
+                                                                final NativeWebRequest request) {
+        LOG.error(exception.getMessage(), exception);
+        return Responses.create(Response.Status.SERVICE_UNAVAILABLE, exception.getMessage(), request);
+    }
+
+    @ExceptionHandler(CursorConversionException.class)
+    public ResponseEntity<Problem> handleCursorConversionException(final CursorConversionException exception,
+                                                                   final NativeWebRequest request) {
+        LOG.error(exception.getMessage(), exception);
+        return Responses.create(UNPROCESSABLE_ENTITY, exception.getMessage(), request);
+    }
+
+    @ExceptionHandler(ServiceTemporarilyUnavailableException.class)
+    public ResponseEntity<Problem> handleServiceTemporaryUnavailableException(
+            final ServiceTemporarilyUnavailableException exception, final NativeWebRequest request) {
+        LOG.error(exception.getMessage(), exception);
+        return Responses.create(Response.Status.SERVICE_UNAVAILABLE, exception.getMessage(), request);
+    }
+
+    @ExceptionHandler(DbWriteOperationsBlockedException.class)
+    public ResponseEntity<Problem> handleDbWriteOperationsBlockedException(
+            final DbWriteOperationsBlockedException exception, final NativeWebRequest request) {
+        LOG.warn(exception.getMessage());
+        return Responses.create(Response.Status.SERVICE_UNAVAILABLE,
+                "Database is currently in read-only mode", request);
+    }
+
 }

@@ -1,23 +1,28 @@
 package org.zalando.nakadi.webservice.hila;
 
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.Lists;
 import org.apache.http.HttpStatus;
 import org.hamcrest.core.StringContains;
 import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Test;
 import org.zalando.nakadi.config.JsonConfig;
-import org.zalando.nakadi.domain.Cursor;
 import org.zalando.nakadi.domain.EventType;
 import org.zalando.nakadi.domain.ItemsWrapper;
 import org.zalando.nakadi.domain.Subscription;
 import org.zalando.nakadi.domain.SubscriptionBase;
-import org.zalando.nakadi.domain.SubscriptionCursor;
 import org.zalando.nakadi.domain.SubscriptionEventTypeStats;
 import org.zalando.nakadi.service.BlacklistService;
 import org.zalando.nakadi.utils.JsonTestHelper;
 import org.zalando.nakadi.utils.RandomSubscriptionBuilder;
+import org.zalando.nakadi.view.Cursor;
+import org.zalando.nakadi.view.EventTypePartitionView;
+import org.zalando.nakadi.view.SubscriptionCursor;
+import org.zalando.nakadi.view.SubscriptionCursorWithoutToken;
 import org.zalando.nakadi.webservice.BaseAT;
 import org.zalando.nakadi.webservice.SettingsControllerAT;
 import org.zalando.nakadi.webservice.utils.NakadiTestUtils;
@@ -26,13 +31,13 @@ import org.zalando.nakadi.webservice.utils.TestStreamingClient;
 import java.io.IOException;
 import java.util.Collections;
 import java.util.List;
-import java.util.stream.IntStream;
+import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
 
 import static com.jayway.restassured.RestAssured.given;
 import static com.jayway.restassured.RestAssured.when;
+import static com.jayway.restassured.http.ContentType.JSON;
 import static java.text.MessageFormat.format;
-import static java.util.stream.IntStream.range;
-import static java.util.stream.IntStream.rangeClosed;
 import static org.apache.http.HttpStatus.SC_CONFLICT;
 import static org.apache.http.HttpStatus.SC_NO_CONTENT;
 import static org.apache.http.HttpStatus.SC_OK;
@@ -43,6 +48,7 @@ import static org.hamcrest.Matchers.empty;
 import static org.hamcrest.Matchers.hasSize;
 import static org.hamcrest.Matchers.not;
 import static org.zalando.nakadi.domain.SubscriptionBase.InitialPosition.BEGIN;
+import static org.zalando.nakadi.domain.SubscriptionBase.InitialPosition.END;
 import static org.zalando.nakadi.utils.TestUtils.waitFor;
 import static org.zalando.nakadi.webservice.hila.StreamBatch.MatcherIgnoringToken.equalToBatchIgnoringToken;
 import static org.zalando.nakadi.webservice.hila.StreamBatch.singleEventBatch;
@@ -50,11 +56,13 @@ import static org.zalando.nakadi.webservice.utils.NakadiTestUtils.commitCursors;
 import static org.zalando.nakadi.webservice.utils.NakadiTestUtils.createEventType;
 import static org.zalando.nakadi.webservice.utils.NakadiTestUtils.createSubscription;
 import static org.zalando.nakadi.webservice.utils.NakadiTestUtils.publishEvent;
+import static org.zalando.nakadi.webservice.utils.NakadiTestUtils.publishEvents;
 import static org.zalando.nakadi.webservice.utils.TestStreamingClient.SESSION_ID_UNKNOWN;
 
 public class HilaAT extends BaseAT {
 
-    private static final JsonTestHelper JSON_TEST_HELPER = new JsonTestHelper(new JsonConfig().jacksonObjectMapper());
+    private static final ObjectMapper MAPPER = (new JsonConfig()).jacksonObjectMapper();
+    private static final JsonTestHelper JSON_TEST_HELPER = new JsonTestHelper(MAPPER);
     private EventType eventType;
     private Subscription subscription;
 
@@ -69,21 +77,40 @@ public class HilaAT extends BaseAT {
         this.subscription = createSubscription(subscription);
     }
 
+    @Test(timeout = 10000)
+    public void whenStreamTimeoutReachedPossibleToCommit() throws Exception {
+        final TestStreamingClient client = TestStreamingClient
+                .create(URL, subscription.getId(), "batch_limit=1&stream_limit=2&stream_timeout=1")
+                .start();
+        waitFor(() -> assertThat(client.getSessionId(), not(equalTo(SESSION_ID_UNKNOWN))));
+
+        publishEvent(eventType.getName(), "{\"foo\":\"bar\"}");
+        waitFor(() -> Assert.assertFalse(client.getBatches().isEmpty()), TimeUnit.SECONDS.toMillis(2), 100);
+        final SubscriptionCursor toCommit = client.getBatches().get(0).getCursor();
+        client.close(); // connection is closed, and stream as well
+        Thread.sleep(TimeUnit.SECONDS.toMillis(1));
+        final int statusCode = commitCursors(
+                subscription.getId(),
+                Collections.singletonList(toCommit),
+                client.getSessionId());
+        Assert.assertEquals(SC_NO_CONTENT, statusCode);
+    }
+
     @Test(timeout = 30000)
     public void whenOffsetIsCommittedNextSessionStartsFromNextEventAfterCommitted() throws Exception {
         // write 4 events to event-type
-        rangeClosed(0, 3)
-                .forEach(x -> publishEvent(eventType.getName(), "{\"blah\":\"foo" + x + "\"}"));
+        publishEvents(eventType.getName(), 4, x -> "{\"foo\":\"bar" + x + "\"}");
 
         // create session, read from subscription and wait for events to be sent
         final TestStreamingClient client = TestStreamingClient
                 .create(URL, subscription.getId(), "stream_limit=2")
                 .start();
         waitFor(() -> assertThat(client.getBatches(), hasSize(2)));
-        assertThat(client.getBatches().get(0), equalToBatchIgnoringToken(singleEventBatch("0", "0", eventType.getName(),
-                ImmutableMap.of("blah", "foo0"), "Stream started")));
-        assertThat(client.getBatches().get(1), equalToBatchIgnoringToken(singleEventBatch("0", "1", eventType.getName(),
-                ImmutableMap.of("blah", "foo1"))));
+        assertThat(client.getBatches().get(0), equalToBatchIgnoringToken(singleEventBatch("0",
+                "001-0001-000000000000000000", eventType.getName(), ImmutableMap.of("foo", "bar0"),
+                "Stream started")));
+        assertThat(client.getBatches().get(1), equalToBatchIgnoringToken(singleEventBatch("0",
+                "001-0001-000000000000000001", eventType.getName(), ImmutableMap.of("foo", "bar1"))));
 
         // commit offset that will also trigger session closing as we reached stream_limit and committed
         commitCursors(subscription.getId(), ImmutableList.of(client.getBatches().get(1).getCursor()),
@@ -95,32 +122,33 @@ public class HilaAT extends BaseAT {
         waitFor(() -> assertThat(client.getBatches(), hasSize(2)));
 
         // check that we have read the next two events with correct offsets
-        assertThat(client.getBatches().get(0), equalToBatchIgnoringToken(singleEventBatch("0", "2", eventType.getName(),
-                ImmutableMap.of("blah", "foo2"), "Stream started")));
-        assertThat(client.getBatches().get(1), equalToBatchIgnoringToken(singleEventBatch("0", "3", eventType.getName(),
-                ImmutableMap.of("blah", "foo3"))));
+        assertThat(client.getBatches().get(0), equalToBatchIgnoringToken(singleEventBatch("0",
+                "001-0001-000000000000000002", eventType.getName(),
+                ImmutableMap.of("foo", "bar2"), "Stream started")));
+        assertThat(client.getBatches().get(1), equalToBatchIgnoringToken(singleEventBatch("0",
+                "001-0001-000000000000000003", eventType.getName(), ImmutableMap.of("foo", "bar3"))));
     }
 
 
     @Test(timeout = 5000)
-    public void whenNoEventsThenFirstOffsetIsBEGIN() throws Exception {
+    public void whenNoEventsThenFirstOffsetIsBEGIN() {
         final TestStreamingClient client = TestStreamingClient
                 .create(URL, subscription.getId(), "batch_flush_timeout=1")
                 .start();
         waitFor(() -> assertThat(client.getBatches(), not(empty())));
-        assertThat(client.getBatches().get(0).getCursor().getOffset(), equalTo(Cursor.BEFORE_OLDEST_OFFSET));
+        assertThat(client.getBatches().get(0).getCursor().getOffset(), equalTo("001-0001--1"));
     }
 
     @Test(timeout = 5000)
     public void whenNoEventsThenBeginOffsetIsUsed() throws Exception {
         final TestStreamingClient client = TestStreamingClient
-                .create(URL, subscription.getId(), "")
+                .create(subscription.getId())
                 .start();
         waitFor(() -> assertThat(client.getSessionId(), not(equalTo(SESSION_ID_UNKNOWN))));
 
         when().get("/subscriptions/{sid}/cursors", subscription.getId())
                 .then()
-                .body("items[0].offset", equalTo(Cursor.BEFORE_OLDEST_OFFSET));
+                .body("items[0].offset", equalTo("001-0001--1"));
 
         final int commitResult = commitCursors(subscription.getId(),
                 ImmutableList.of(new SubscriptionCursor("0", Cursor.BEFORE_OLDEST_OFFSET, eventType.getName(), "abc")),
@@ -130,11 +158,11 @@ public class HilaAT extends BaseAT {
 
     @Test(timeout = 5000)
     public void whenCommitVeryFirstEventThenOk() throws Exception {
-        publishEvent(eventType.getName(), "{\"blah\":\"foo\"}");
+        publishEvent(eventType.getName(), "{\"foo\":\"bar\"}");
 
         // create session, read from subscription and wait for events to be sent
         final TestStreamingClient client = TestStreamingClient
-                .create(URL, subscription.getId(), "")
+                .create(subscription.getId())
                 .start();
         waitFor(() -> assertThat(client.getBatches(), not(empty())));
 
@@ -148,7 +176,7 @@ public class HilaAT extends BaseAT {
     @Test(timeout = 15000)
     public void whenWindowSizeIsSetItIsConsidered() throws Exception {
 
-        range(0, 15).forEach(x -> publishEvent(eventType.getName(), "{\"blah\":\"foo\"}"));
+        publishEvents(eventType.getName(), 15, i -> "{\"foo\":\"bar\"}");
 
         final TestStreamingClient client = TestStreamingClient
                 .create(URL, subscription.getId(), "max_uncommitted_events=5")
@@ -168,24 +196,24 @@ public class HilaAT extends BaseAT {
     }
 
     @Test(timeout = 15000)
-    public void whenCommitTimeoutReachedSessionIsClosed() throws Exception {
+    public void whenCommitTimeoutReachedSessionIsClosed() {
 
-        publishEvent(eventType.getName(), "{\"blah\":\"foo\"}");
+        publishEvent(eventType.getName(), "{\"foo\":\"bar\"}");
 
         final TestStreamingClient client = TestStreamingClient
-                .create(URL, subscription.getId(), "") // commit_timeout is 5 seconds for test
+                .create(subscription.getId()) // commit_timeout is 5 seconds for test
                 .start();
 
         waitFor(() -> assertThat(client.getBatches(), hasSize(2)), 10000);
         waitFor(() -> assertThat(client.isRunning(), is(false)), 10000);
-        assertThat(client.getBatches().get(1), equalToBatchIgnoringToken(singleEventBatch("0", "0", eventType.getName(),
-                ImmutableMap.of(), "Commit timeout reached")));
+        assertThat(client.getBatches().get(1), equalToBatchIgnoringToken(singleEventBatch("0",
+                "001-0001-000000000000000000", eventType.getName(), ImmutableMap.of(), "Commit timeout reached")));
     }
 
     @Test(timeout = 15000)
     public void whenStreamTimeoutReachedSessionIsClosed() throws Exception {
 
-        publishEvent(eventType.getName(), "{\"blah\":\"foo\"}");
+        publishEvent(eventType.getName(), "{\"foo\":\"bar\"}");
 
         final TestStreamingClient client = TestStreamingClient
                 .create(URL, subscription.getId(), "stream_timeout=3")
@@ -202,9 +230,9 @@ public class HilaAT extends BaseAT {
     }
 
     @Test(timeout = 10000)
-    public void whenBatchLimitAndTimeoutAreSetTheyAreConsidered() throws Exception {
+    public void whenBatchLimitAndTimeoutAreSetTheyAreConsidered() {
 
-        range(0, 12).forEach(x -> publishEvent(eventType.getName(), "{\"blah\":\"foo\"}"));
+        publishEvents(eventType.getName(), 12, i -> "{\"foo\":\"bar\"}");
 
         final TestStreamingClient client = TestStreamingClient
                 .create(URL, subscription.getId(), "batch_limit=5&batch_flush_timeout=1&max_uncommitted_events=20")
@@ -213,17 +241,17 @@ public class HilaAT extends BaseAT {
         waitFor(() -> assertThat(client.getBatches(), hasSize(3)));
 
         assertThat(client.getBatches().get(0).getEvents(), hasSize(5));
-        assertThat(client.getBatches().get(0).getCursor().getOffset(), is("4"));
+        assertThat(client.getBatches().get(0).getCursor().getOffset(), is("001-0001-000000000000000004"));
 
         assertThat(client.getBatches().get(1).getEvents(), hasSize(5));
-        assertThat(client.getBatches().get(1).getCursor().getOffset(), is("9"));
+        assertThat(client.getBatches().get(1).getCursor().getOffset(), is("001-0001-000000000000000009"));
 
         assertThat(client.getBatches().get(2).getEvents(), hasSize(2));
-        assertThat(client.getBatches().get(2).getCursor().getOffset(), is("11"));
+        assertThat(client.getBatches().get(2).getCursor().getOffset(), is("001-0001-000000000000000011"));
     }
 
     @Test(timeout = 10000)
-    public void whenThereAreNoEmptySlotsThenConflict() throws Exception {
+    public void whenThereAreNoEmptySlotsThenConflict() {
 
         final TestStreamingClient client = TestStreamingClient
                 .create(URL, subscription.getId(), "batch_flush_timeout=1");
@@ -245,7 +273,7 @@ public class HilaAT extends BaseAT {
         waitFor(() -> assertThat(client.getBatches(), hasSize(1)));
 
         client.close();
-        Thread.sleep(2000);
+        Thread.sleep(2500);
 
         final TestStreamingClient anotherClient = TestStreamingClient
                 .create(URL, subscription.getId(), "batch_flush_timeout=1");
@@ -255,9 +283,9 @@ public class HilaAT extends BaseAT {
         waitFor(() -> assertThat(anotherClient.getBatches(), hasSize(1)));
     }
 
-    @Test
+    @Test(timeout = 10000)
     public void testGetSubscriptionStat() throws Exception {
-        IntStream.range(0, 15).forEach(x -> publishEvent(eventType.getName(), "{\"blah\":\"foo\"}"));
+        publishEvents(eventType.getName(), 15, i -> "{\"foo\":\"bar\"}");
 
         final TestStreamingClient client = TestStreamingClient
                 .create(URL, subscription.getId(), "max_uncommitted_events=20")
@@ -267,7 +295,7 @@ public class HilaAT extends BaseAT {
         List<SubscriptionEventTypeStats> subscriptionStats =
                 Collections.singletonList(new SubscriptionEventTypeStats(
                         eventType.getName(),
-                        Collections.singleton(
+                        Collections.singletonList(
                                 new SubscriptionEventTypeStats.Partition("0", "assigned", 15L, client.getSessionId())))
                 );
         NakadiTestUtils.getSubscriptionStat(subscription)
@@ -281,7 +309,7 @@ public class HilaAT extends BaseAT {
         subscriptionStats =
                 Collections.singletonList(new SubscriptionEventTypeStats(
                         eventType.getName(),
-                        Collections.singleton(
+                        Collections.singletonList(
                                 new SubscriptionEventTypeStats.Partition("0", "assigned", 5L, client.getSessionId())))
                 );
         NakadiTestUtils.getSubscriptionStat(subscription)
@@ -289,28 +317,69 @@ public class HilaAT extends BaseAT {
                 .content(new StringContains(JSON_TEST_HELPER.asJsonString(new ItemsWrapper<>(subscriptionStats))));
     }
 
+    @Test
+    public void testSubscriptionStatsMultiET() throws IOException {
+        final List<EventType> eventTypes = Lists.newArrayList(createEventType(), createEventType());
+        publishEvents(eventTypes.get(0).getName(), 10, i -> "{\"foo\":\"bar\"}");
+        publishEvents(eventTypes.get(1).getName(), 20, i -> "{\"foo\":\"bar\"}");
+
+        final Subscription subscription = NakadiTestUtils.createSubscription(RandomSubscriptionBuilder.builder()
+                .withEventTypes(eventTypes.stream().map(EventType::getName).collect(Collectors.toSet()))
+                .withStartFrom(END)
+                .build());
+        // client is needed only to initialize stats
+        final TestStreamingClient client = TestStreamingClient
+                .create(URL, subscription.getId(), "batch_flush_timeout=1")
+                .start();
+
+        waitFor(() -> assertThat(client.getBatches().isEmpty(), is(false)));
+
+        publishEvents(eventTypes.get(0).getName(), 1, i -> "{\"foo\":\"bar\"}");
+        publishEvents(eventTypes.get(1).getName(), 2, i -> "{\"foo\":\"bar\"}");
+
+        NakadiTestUtils.getSubscriptionStat(subscription)
+                .then()
+                .content(new StringContains(JSON_TEST_HELPER.asJsonString(new SubscriptionEventTypeStats(
+                        eventTypes.get(0).getName(),
+                        Collections.singletonList(new SubscriptionEventTypeStats.Partition(
+                                "0",
+                                "assigned",
+                                1L,
+                                client.getSessionId()
+                        ))))))
+                .content(new StringContains(JSON_TEST_HELPER.asJsonString(new SubscriptionEventTypeStats(
+                        eventTypes.get(1).getName(),
+                        Collections.singletonList(new SubscriptionEventTypeStats.Partition(
+                                "0",
+                                "assigned",
+                                2L,
+                                client.getSessionId()
+                        ))))));
+        client.close();
+    }
+
     @Test(timeout = 10000)
     public void whenConsumerIsBlocked403() throws Exception {
         SettingsControllerAT.blacklist(eventType.getName(), BlacklistService.Type.CONSUMER_ET);
 
         final TestStreamingClient client1 = TestStreamingClient
-                .create(URL, subscription.getId(), "")
+                .create(subscription.getId())
                 .start();
         waitFor(() -> Assert.assertEquals(403, client1.getResponseCode()));
 
         SettingsControllerAT.whitelist(eventType.getName(), BlacklistService.Type.CONSUMER_ET);
 
         final TestStreamingClient client2 = TestStreamingClient
-                .create(URL, subscription.getId(), "")
+                .create(subscription.getId())
                 .start();
         waitFor(() -> Assert.assertEquals(HttpStatus.SC_OK, client2.getResponseCode()));
     }
 
     @Test(timeout = 10000)
     public void whenConsumerIsBlockedDuringConsumption() throws Exception {
-        IntStream.range(0, 5).forEach(x -> publishEvent(eventType.getName(), "{\"blah\":\"foo\"}"));
+        publishEvents(eventType.getName(), 5, i -> "{\"foo\":\"bar\"}");
         final TestStreamingClient client = TestStreamingClient
-                .create(URL, subscription.getId(), "")
+                .create(subscription.getId())
                 .start();
         waitFor(() -> assertThat(client.getBatches(), hasSize(5)));
         SettingsControllerAT.blacklist(eventType.getName(), BlacklistService.Type.CONSUMER_ET);
@@ -323,17 +392,129 @@ public class HilaAT extends BaseAT {
     }
 
     @Test(timeout = 15000)
-    public void whenStreamTimeout0ThenInfiniteStreaming() throws Exception {
-        IntStream.range(0, 5).forEach(x -> publishEvent(eventType.getName(), "{\"blah\":\"foo\"}"));
+    public void whenStreamTimeout0ThenInfiniteStreaming() {
+        publishEvents(eventType.getName(), 5, i -> "{\"foo\":\"bar\"}");
         final TestStreamingClient client = TestStreamingClient
                 .create(URL, subscription.getId(), "stream_timeout=0")
                 .start();
 
         waitFor(() -> assertThat(client.getBatches(), hasSize(5)));
-        Assert.assertFalse(client.getBatches().stream().anyMatch(streamBatch -> {
-                    if (streamBatch.getMetadata() != null)
-                        return streamBatch.getMetadata().getDebug().equals("Stream timeout reached");
-                    return false;
-                }));
+        Assert.assertFalse(client.getBatches().stream()
+                .anyMatch(streamBatch -> streamBatch.getMetadata() != null
+                        && streamBatch.getMetadata().getDebug().equals("Stream timeout reached")));
+    }
+
+    @Test(timeout = 15000)
+    public void whenResetCursorsThenStreamFromResetCursorOffset() throws Exception {
+        publishEvents(eventType.getName(), 20, i -> "{\"foo\":\"bar\"}");
+        final TestStreamingClient client1 = TestStreamingClient
+                .create(subscription.getId())
+                .start();
+        waitFor(() -> assertThat(client1.getBatches(), hasSize(10)));
+
+        int statusCode = commitCursors(
+                subscription.getId(),
+                Collections.singletonList(client1.getBatches().get(9).getCursor()),
+                client1.getSessionId());
+        Assert.assertEquals(SC_NO_CONTENT, statusCode);
+
+        final List<SubscriptionCursor> resetCursors =
+                Collections.singletonList(client1.getBatches().get(4).getCursor());
+        statusCode = given()
+                .body(MAPPER.writeValueAsString(new ItemsWrapper<>(resetCursors)))
+                .contentType(JSON)
+                .patch("/subscriptions/{id}/cursors", subscription.getId())
+                .getStatusCode();
+        Assert.assertEquals(SC_NO_CONTENT, statusCode);
+        Assert.assertFalse(client1.isRunning());
+        Assert.assertTrue(client1.getBatches().stream()
+                .anyMatch(streamBatch -> streamBatch.getMetadata() != null
+                        && streamBatch.getMetadata().getDebug().equals("Resetting subscription cursors")));
+
+
+        final TestStreamingClient client2 = TestStreamingClient
+                .create(subscription.getId())
+                .start();
+        waitFor(() -> assertThat(client2.getBatches(), hasSize(10)));
+
+        Assert.assertEquals("001-0001-000000000000000005", client2.getBatches().get(0).getCursor().getOffset());
+    }
+
+    @Test(timeout = 15000)
+    public void whenPatchThenCursorsAreInitializedToDefault() throws Exception {
+        final EventType et = createEventType();
+        publishEvents(et.getName(), 10, i -> "{\"foo\": \"bar\"}");
+        Thread.sleep(1000L);
+        final Subscription s = createSubscription(RandomSubscriptionBuilder.builder()
+                .withEventType(et.getName())
+                .withStartFrom(END)
+                .buildSubscriptionBase());
+        given()
+                .body(MAPPER.writeValueAsString(new ItemsWrapper<>(Collections.emptyList())))
+                .contentType(JSON)
+                .patch("/subscriptions/{id}/cursors", s.getId())
+                .then()
+                .statusCode(SC_NO_CONTENT);
+
+        final ItemsWrapper<SubscriptionCursor> subscriptionCursors = MAPPER.readValue(
+                given().get("/subscriptions/{id}/cursors", s.getId()).getBody().asString(),
+                new TypeReference<ItemsWrapper<SubscriptionCursor>>() {
+                }
+        );
+        final List<EventTypePartitionView> etStats = MAPPER.readValue(
+                given().get("/event-types/{et}/partitions", et.getName()).getBody().asString(),
+                new TypeReference<List<EventTypePartitionView>>() {
+                }
+        );
+        Assert.assertEquals(subscriptionCursors.getItems().size(), etStats.size());
+        subscriptionCursors.getItems().forEach(sCursor -> {
+            final boolean offsetSame = etStats.stream()
+                    .anyMatch(ss -> ss.getPartitionId().equals(sCursor.getPartition()) &&
+                            ss.getNewestAvailableOffset().equals(sCursor.getOffset()));
+            // Check that after patch cursors are the same as END
+            Assert.assertTrue(offsetSame);
+        });
+    }
+
+    @Test(timeout = 15000)
+    public void whenPatchThenCursorsAreInitializedAndPatched() throws Exception {
+        final EventType et = createEventType();
+        publishEvents(et.getName(), 10, i -> "{\"foo\": \"bar\"}");
+        final List<EventTypePartitionView> etStats = MAPPER.readValue(
+                given().get("/event-types/{et}/partitions", et.getName()).getBody().asString(),
+                new TypeReference<List<EventTypePartitionView>>() {
+                }
+        );
+        final EventTypePartitionView begin = etStats.get(0);
+        final Subscription s = createSubscription(RandomSubscriptionBuilder.builder()
+                .withEventType(et.getName())
+                .withStartFrom(END)
+                .buildSubscriptionBase());
+        given()
+                .body(MAPPER.writeValueAsString(new ItemsWrapper<>(Collections.singletonList(
+                        new SubscriptionCursorWithoutToken(
+                                et.getName(), begin.getPartitionId(), begin.getOldestAvailableOffset())
+                ))))
+                .contentType(JSON)
+                .patch("/subscriptions/{id}/cursors", s.getId())
+                .then()
+                .statusCode(SC_NO_CONTENT);
+
+        final ItemsWrapper<SubscriptionCursor> subscriptionCursors = MAPPER.readValue(
+                given().get("/subscriptions/{id}/cursors", s.getId()).getBody().asString(),
+                new TypeReference<ItemsWrapper<SubscriptionCursor>>() {
+                }
+        );
+
+        Assert.assertEquals(subscriptionCursors.getItems().size(), etStats.size());
+
+        subscriptionCursors.getItems().forEach(item -> {
+            if (item.getPartition().equals(begin.getPartitionId())) {
+                Assert.assertEquals(begin.getOldestAvailableOffset(), item.getOffset());
+            } else {
+                Assert.assertEquals(begin.getNewestAvailableOffset(), item.getOffset());
+            }
+        });
+
     }
 }
