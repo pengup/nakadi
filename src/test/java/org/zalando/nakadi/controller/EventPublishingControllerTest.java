@@ -12,25 +12,27 @@ import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.ResultActions;
 import org.springframework.test.web.servlet.request.MockHttpServletRequestBuilder;
 import org.zalando.nakadi.config.SecuritySettings;
+import org.zalando.nakadi.controller.advice.EventPublishingExceptionHandler;
+import org.zalando.nakadi.controller.advice.NakadiProblemExceptionHandler;
 import org.zalando.nakadi.domain.BatchItemResponse;
 import org.zalando.nakadi.domain.EventPublishResult;
 import org.zalando.nakadi.domain.EventPublishingStatus;
 import org.zalando.nakadi.domain.EventPublishingStep;
-import org.zalando.nakadi.exceptions.EventTypeTimeoutException;
-import org.zalando.nakadi.exceptions.InternalNakadiException;
-import org.zalando.nakadi.exceptions.NoSuchEventTypeException;
+import org.zalando.nakadi.exceptions.runtime.InternalNakadiException;
+import org.zalando.nakadi.exceptions.runtime.NoSuchEventTypeException;
+import org.zalando.nakadi.exceptions.runtime.EventTypeTimeoutException;
 import org.zalando.nakadi.metrics.EventTypeMetricRegistry;
 import org.zalando.nakadi.metrics.EventTypeMetrics;
-import org.zalando.nakadi.security.Client;
+import org.zalando.nakadi.plugin.api.authz.AuthorizationService;
 import org.zalando.nakadi.security.ClientResolver;
 import org.zalando.nakadi.service.BlacklistService;
 import org.zalando.nakadi.service.EventPublisher;
 import org.zalando.nakadi.service.NakadiKpiPublisher;
-import org.zalando.nakadi.service.FeatureToggleService;
 import org.zalando.nakadi.utils.TestUtils;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
 import java.util.function.Supplier;
 
 import static org.hamcrest.CoreMatchers.equalTo;
@@ -70,21 +72,22 @@ public class EventPublishingControllerTest {
     private EventTypeMetricRegistry eventTypeMetricRegistry;
     private NakadiKpiPublisher kpiPublisher;
     private BlacklistService blacklistService;
+    private AuthorizationService authorizationService;
 
     @Before
-    public void setUp() throws Exception {
+    public void setUp() {
         metricRegistry = new MetricRegistry();
         publisher = mock(EventPublisher.class);
         eventTypeMetricRegistry = new EventTypeMetricRegistry(metricRegistry);
         kpiPublisher = mock(NakadiKpiPublisher.class);
         settings = mock(SecuritySettings.class);
+        authorizationService = mock(AuthorizationService.class);
+        when(authorizationService.getSubject()).thenReturn(Optional.of(() ->  "adminClientId"));
         when(settings.getAuthMode()).thenReturn(OFF);
-        when(settings.getAdminClientId()).thenReturn("nakadi");
+        when(settings.getAdminClientId()).thenReturn("adminClientId");
 
         blacklistService = Mockito.mock(BlacklistService.class);
         when(blacklistService.isProductionBlocked(any(), any())).thenReturn(false);
-
-        final FeatureToggleService featureToggleService = Mockito.mock(FeatureToggleService.class);
 
         final EventPublishingController controller =
                 new EventPublishingController(publisher, eventTypeMetricRegistry, blacklistService, kpiPublisher,
@@ -92,7 +95,8 @@ public class EventPublishingControllerTest {
 
         mockMvc = standaloneSetup(controller)
                 .setMessageConverters(new StringHttpMessageConverter(), TestUtils.JACKSON_2_HTTP_MESSAGE_CONVERTER)
-                .setCustomArgumentResolvers(new ClientResolver(settings, featureToggleService))
+                .setCustomArgumentResolvers(new ClientResolver(settings, authorizationService))
+                .setControllerAdvice(new NakadiProblemExceptionHandler(), new EventPublishingExceptionHandler())
                 .build();
     }
 
@@ -103,7 +107,7 @@ public class EventPublishingControllerTest {
         Mockito
                 .doReturn(result)
                 .when(publisher)
-                .publish(any(String.class), eq(TOPIC), any(Client.class));
+                .publish(any(String.class), eq(TOPIC));
 
         postBatch(TOPIC, EVENT_BATCH)
                 .andExpect(status().isOk())
@@ -115,14 +119,14 @@ public class EventPublishingControllerTest {
 
         Mockito.doThrow(new JSONException("Error"))
                 .when(publisher)
-                .publish(any(String.class), eq(TOPIC), any(Client.class));
+                .publish(any(String.class), eq(TOPIC));
 
         postBatch(TOPIC, "invalid json array").andExpect(status().isBadRequest());
     }
 
     @Test
     public void whenEventPublishTimeoutThen503() throws Exception {
-        when(publisher.publish(any(), any(), any())).thenThrow(new EventTypeTimeoutException(""));
+        when(publisher.publish(any(), any())).thenThrow(new EventTypeTimeoutException(""));
 
         postBatch(TOPIC, EVENT_BATCH)
                 .andExpect(content().contentType("application/problem+json"))
@@ -136,7 +140,7 @@ public class EventPublishingControllerTest {
         Mockito
                 .doReturn(result)
                 .when(publisher)
-                .publish(any(String.class), eq(TOPIC), any(Client.class));
+                .publish(any(String.class), eq(TOPIC));
 
         postBatch(TOPIC, EVENT_BATCH)
                 .andExpect(status().isUnprocessableEntity())
@@ -150,7 +154,7 @@ public class EventPublishingControllerTest {
         Mockito
                 .doReturn(result)
                 .when(publisher)
-                .publish(any(String.class), eq(TOPIC), any(Client.class));
+                .publish(any(String.class), eq(TOPIC));
 
         postBatch(TOPIC, EVENT_BATCH)
                 .andExpect(status().isMultiStatus())
@@ -160,9 +164,9 @@ public class EventPublishingControllerTest {
     @Test
     public void whenEventTypeNotFoundThen404() throws Exception {
         Mockito
-                .doThrow(NoSuchEventTypeException.class)
+                .doThrow(new NoSuchEventTypeException("topic not found"))
                 .when(publisher)
-                .publish(any(String.class), eq(TOPIC), any(Client.class));
+                .publish(any(String.class), eq(TOPIC));
 
         postBatch(TOPIC, EVENT_BATCH)
                 .andExpect(content().contentType("application/problem+json"))
@@ -177,7 +181,7 @@ public class EventPublishingControllerTest {
                 .doReturn(success)
                 .doThrow(InternalNakadiException.class)
                 .when(publisher)
-                .publish(any(), any(), any(Client.class));
+                .publish(any(), any());
 
         postBatch(TOPIC, EVENT_BATCH);
         postBatch(TOPIC, EVENT_BATCH);
@@ -197,7 +201,7 @@ public class EventPublishingControllerTest {
                 .doReturn(success)
                 .doThrow(InternalNakadiException.class)
                 .when(publisher)
-                .publish(any(), any(), any(Client.class));
+                .publish(any(), any());
 
         when(kpiPublisher.hash(any())).thenReturn("hashed-application-name");
 
@@ -217,7 +221,7 @@ public class EventPublishingControllerTest {
                         .put("app_hashed", "hashed-application-name")
                         .put("event_type", "my-topic")
                         .put("batch_size", 33)
-                        .put("number_of_events",3)).allowingExtraUnexpectedFields()));
+                        .put("number_of_events", 3)).allowingExtraUnexpectedFields()));
 
         assertThat(kpi.getInt("ms_spent"), is(notNullValue()));
     }

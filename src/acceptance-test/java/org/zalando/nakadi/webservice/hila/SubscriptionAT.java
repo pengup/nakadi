@@ -19,7 +19,9 @@ import org.zalando.nakadi.domain.EventTypePartition;
 import org.zalando.nakadi.domain.ItemsWrapper;
 import org.zalando.nakadi.domain.PaginationLinks;
 import org.zalando.nakadi.domain.PaginationWrapper;
+import org.zalando.nakadi.domain.ResourceAuthorizationAttribute;
 import org.zalando.nakadi.domain.Subscription;
+import org.zalando.nakadi.domain.SubscriptionAuthorization;
 import org.zalando.nakadi.domain.SubscriptionBase;
 import org.zalando.nakadi.domain.SubscriptionEventTypeStats;
 import org.zalando.nakadi.utils.JsonTestHelper;
@@ -32,8 +34,10 @@ import org.zalando.nakadi.webservice.BaseAT;
 import org.zalando.nakadi.webservice.utils.NakadiTestUtils;
 import org.zalando.nakadi.webservice.utils.TestStreamingClient;
 import org.zalando.nakadi.webservice.utils.ZookeeperTestUtils;
+import org.zalando.problem.Problem;
 
 import java.io.IOException;
+import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
 import java.util.stream.Collectors;
@@ -57,8 +61,11 @@ import static org.zalando.nakadi.utils.TestUtils.waitFor;
 import static org.zalando.nakadi.webservice.utils.NakadiTestUtils.createBusinessEventTypeWithPartitions;
 import static org.zalando.nakadi.webservice.utils.NakadiTestUtils.createSubscription;
 import static org.zalando.nakadi.webservice.utils.NakadiTestUtils.createSubscriptionForEventType;
+import static org.zalando.nakadi.webservice.utils.NakadiTestUtils.createSubscriptionForEventTypeFromBegin;
 import static org.zalando.nakadi.webservice.utils.NakadiTestUtils.publishBusinessEventWithUserDefinedPartition;
+import static org.zalando.nakadi.webservice.utils.NakadiTestUtils.publishEvents;
 import static org.zalando.nakadi.webservice.utils.TestStreamingClient.SESSION_ID_UNKNOWN;
+import static org.zalando.problem.Status.UNPROCESSABLE_ENTITY;
 
 public class SubscriptionAT extends BaseAT {
 
@@ -110,7 +117,8 @@ public class SubscriptionAT extends BaseAT {
 
         // retrieve subscription object from response
         final Subscription subFirst = MAPPER.readValue(response.print(), Subscription.class);
-
+        //check initialization of updated_At
+        assertThat(subFirst.getUpdatedAt(), equalTo(subFirst.getCreatedAt()));
         // when we try to create that subscription again - we should get status 200
         // and the subscription that already exists should be returned
         response = given()
@@ -133,6 +141,40 @@ public class SubscriptionAT extends BaseAT {
         response.then().statusCode(HttpStatus.SC_OK).contentType(JSON);
         final Subscription gotSubscription = MAPPER.readValue(response.print(), Subscription.class);
         assertThat(gotSubscription, equalTo(subFirst));
+
+        //Check for update time of the subscription
+        final Subscription updateSub = subFirst;
+        updateSub.setAuthorization(new SubscriptionAuthorization(
+                Collections.singletonList(new ResourceAuthorizationAttribute("user", "me")),
+                Collections.singletonList(new ResourceAuthorizationAttribute("user", "me"))));
+        final String updatedSubscription = MAPPER.writeValueAsString(updateSub);
+
+        response = given()
+                .body(updatedSubscription)
+                .contentType(JSON)
+                .put(format(SUBSCRIPTION_URL, subFirst.getId()));
+
+        response
+                .then()
+                .statusCode(HttpStatus.SC_NO_CONTENT);
+
+        response = get(format(SUBSCRIPTION_URL, subFirst.getId()));
+        response.then().statusCode(HttpStatus.SC_OK).contentType(JSON);
+        final Subscription updatedSub = MAPPER.readValue(response.print(), Subscription.class);
+        assertThat(updatedSub.getUpdatedAt(), not(equalTo(subFirst.getUpdatedAt())));
+    }
+
+    @Test
+    public void testSubscriptionWithNullAuthorisation() {
+        final EventType eventType = createEventType();
+        final String subscription = "{\"owning_application\":\"app\",\"event_types\":[\""
+                + eventType.getName() + "\"], \"read_from\": \"end\", \"consumer_group\":\"test\"," +
+                "\"authorization\": {\"admins\": [], \"readers\": []}}";
+        final Response response = given().body(subscription).contentType(JSON).post(SUBSCRIPTIONS_URL);
+        response.then()
+                .statusCode(HttpStatus.SC_UNPROCESSABLE_ENTITY)
+                .contentType(JSON)
+                .body("title", equalTo("Unprocessable Entity"));
     }
 
     @Test
@@ -366,7 +408,7 @@ public class SubscriptionAT extends BaseAT {
     }
 
     @Test
-    public void whenStatsOnNotInitializedSubscriptionThanCorrectResponse() throws IOException {
+    public void whenStatsOnNotInitializedSubscriptionThenCorrectResponse() throws IOException {
         final String et = createEventType().getName();
         final Subscription s = createSubscriptionForEventType(et);
         final Response response = when().get("/subscriptions/{sid}/stats", s.getId())
@@ -384,8 +426,102 @@ public class SubscriptionAT extends BaseAT {
             Assert.assertNotNull(partition.getPartition());
             Assert.assertEquals("", partition.getStreamId());
             Assert.assertNull(partition.getUnconsumedEvents());
-            Assert.assertEquals(partition.getState(), "unassigned");
+            Assert.assertEquals("unassigned", partition.getState());
         }
+    }
+
+    @Test
+    public void whenLightStatsOnNotInitializedSubscriptionThenCorrectResponse() throws IOException {
+        final String et = createEventType().getName();
+        final Subscription s = createSubscriptionForEventType(et);
+        final String owningApplication = s.getOwningApplication();
+        final Response response = when()
+                .get("/subscriptions?show_status=true&owning_application=" + owningApplication)
+                .thenReturn();
+        final ItemsWrapper<Subscription> subsItems = MAPPER.readValue(response.print(),
+                new TypeReference<ItemsWrapper<Subscription>>(){});
+        for (final Subscription subscription: subsItems.getItems()) {
+            if (subscription.getId().equals(s.getId())) {
+                Assert.assertNotNull(subscription.getStatus());
+                Assert.assertEquals("unassigned", subscription.getStatus().get(0).getPartitions().get(0).getState());
+                Assert.assertEquals("", subscription.getStatus().get(0).getPartitions().get(0).getStreamId());
+                return;
+            }
+        }
+        Assert.assertTrue(false);
+    }
+
+    @Test
+    public void whenLightStatsOnActiveSubscriptionThenCorrectRespones() throws IOException {
+        final String et = createEventType().getName();
+        final Subscription s = createSubscriptionForEventTypeFromBegin(et);
+        final String owningApplication = s.getOwningApplication();
+
+        publishEvents(et, 15, i -> "{\"foo\":\"bar\"}");
+
+        final TestStreamingClient client = TestStreamingClient
+                .create(URL, s.getId(), "max_uncommitted_events=20")
+                .start();
+        waitFor(() -> assertThat(client.getBatches(), hasSize(15)));
+
+        final Response response = when()
+                .get("/subscriptions?show_status=true&owning_application=" + owningApplication)
+                .thenReturn();
+        final ItemsWrapper<Subscription> subsItems = MAPPER.readValue(response.print(),
+                new TypeReference<ItemsWrapper<Subscription>>(){});
+        for (final Subscription subscription: subsItems.getItems()) {
+            if (subscription.getId().equals(s.getId())) {
+                Assert.assertNotNull(subscription.getStatus());
+                Assert.assertEquals("assigned", subscription.getStatus().get(0).getPartitions().get(0).getState());
+                Assert.assertEquals(client.getSessionId(),
+                        subscription.getStatus().get(0).getPartitions().get(0).getStreamId());
+                Assert.assertEquals(SubscriptionEventTypeStats.Partition.AssignmentType.AUTO,
+                        subscription.getStatus().get(0).getPartitions().get(0).getAssignmentType());
+                return;
+            }
+        }
+        Assert.assertTrue(false);
+    }
+
+    @Test
+    public void whenStreamDuplicatePartitionsThenUnprocessableEntity() throws IOException {
+        final String et = createEventType().getName();
+        final Subscription s = createSubscriptionForEventType(et);
+
+        final String body = "{\"partitions\":[" +
+                "{\"event_type\":\"et1\",\"partition\":\"0\"}," +
+                "{\"event_type\":\"et1\",\"partition\":\"0\"}]}";
+        given().body(body)
+                .contentType(JSON)
+                .when()
+                .post("/subscriptions/{sid}/events", s.getId())
+                .then()
+                .statusCode(HttpStatus.SC_UNPROCESSABLE_ENTITY)
+                .body(JSON_HELPER.matchesObject(Problem.valueOf(
+                        UNPROCESSABLE_ENTITY,
+                        "Duplicated partition specified")));
+    }
+
+    @Test
+    public void whenStreamWrongPartitionsThenUnprocessableEntity() throws IOException {
+        final String et = createEventType().getName();
+        final Subscription s = createSubscriptionForEventType(et);
+
+        final String body = "{\"partitions\":[" +
+                "{\"event_type\":\"" + et + "\",\"partition\":\"0\"}," +
+                "{\"event_type\":\"" + et + "\",\"partition\":\"1\"}," +
+                "{\"event_type\":\"dummy-et-123\",\"partition\":\"0\"}]}";
+        given().body(body)
+                .contentType(JSON)
+                .when()
+                .post("/subscriptions/{sid}/events", s.getId())
+                .then()
+                .statusCode(HttpStatus.SC_UNPROCESSABLE_ENTITY)
+                .body(JSON_HELPER.matchesObject(Problem.valueOf(
+                        UNPROCESSABLE_ENTITY,
+                        "Wrong partitions specified - some partitions don't belong to subscription: " +
+                                "EventTypePartition{eventType='" + et + "', partition='1'}, " +
+                                "EventTypePartition{eventType='dummy-et-123', partition='0'}")));
     }
 
     private Response commitCursors(final Subscription subscription, final String cursor, final String streamId) {

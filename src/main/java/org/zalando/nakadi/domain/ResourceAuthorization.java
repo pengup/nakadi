@@ -1,8 +1,9 @@
 package org.zalando.nakadi.domain;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.databind.annotation.JsonDeserialize;
-import org.zalando.nakadi.exceptions.runtime.UnknownOperationException;
+import com.google.common.collect.ImmutableMap;
 import org.zalando.nakadi.plugin.api.authz.AuthorizationAttribute;
 import org.zalando.nakadi.plugin.api.authz.AuthorizationService;
 
@@ -10,13 +11,17 @@ import javax.annotation.concurrent.Immutable;
 import javax.validation.Valid;
 import javax.validation.constraints.NotNull;
 import javax.validation.constraints.Size;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 @Immutable
-public class ResourceAuthorization {
+public class ResourceAuthorization implements ValidatableAuthorization {
 
     @NotNull
     @Valid
@@ -58,18 +63,10 @@ public class ResourceAuthorization {
         return writers;
     }
 
-    public List<AuthorizationAttribute> getList(final AuthorizationService.Operation operation)
-            throws UnknownOperationException {
-        switch (operation) {
-            case ADMIN:
-                return admins;
-            case READ:
-                return readers;
-            case WRITE:
-                return writers;
-            default:
-                throw new UnknownOperationException("Unknown operation: " + operation.toString());
-        }
+    @JsonIgnore
+    public List<AuthorizationAttribute> getAll() {
+        return Stream.of(this.writers, this.admins, this.readers)
+                .flatMap(Collection::stream).collect(Collectors.toList());
     }
 
     public List<Permission> toPermissionsList(final String resource) {
@@ -88,18 +85,42 @@ public class ResourceAuthorization {
     public static ResourceAuthorization fromPermissionsList(final List<Permission> permissions) {
         final List<AuthorizationAttribute> admins = permissions.stream()
                 .filter(p -> p.getOperation().equals(AuthorizationService.Operation.ADMIN))
-                .map(p -> p.getAuthorizationAttribute())
+                .map(Permission::getAuthorizationAttribute)
                 .collect(Collectors.toList());
         final List<AuthorizationAttribute> readers = permissions.stream()
                 .filter(p -> p.getOperation().equals(AuthorizationService.Operation.READ))
-                .map(p -> p.getAuthorizationAttribute())
+                .map(Permission::getAuthorizationAttribute)
                 .collect(Collectors.toList());
         final List<AuthorizationAttribute> writers = permissions.stream()
                 .filter(p -> p.getOperation().equals(AuthorizationService.Operation.WRITE))
-                .map(p -> p.getAuthorizationAttribute())
+                .map(Permission::getAuthorizationAttribute)
                 .collect(Collectors.toList());
 
         return new ResourceAuthorization(admins, readers, writers);
+    }
+
+    public Optional<List<AuthorizationAttribute>> getAttributesForOperation(
+            final AuthorizationService.Operation operation) {
+        switch (operation) {
+            case READ:
+                return Optional.of(getReaders());
+            case WRITE:
+                return Optional.of(getWriters());
+            case ADMIN:
+                return Optional.of(getAdmins());
+            case VIEW:
+                return Optional.of(getAll());
+            default:
+                throw new IllegalArgumentException("Operation " + operation + " is not supported");
+        }
+    }
+
+    @Override
+    public Map<String, List<AuthorizationAttribute>> asMapValue() {
+        return ImmutableMap.of(
+                AuthorizationService.Operation.ADMIN.toString(), getAdmins(),
+                AuthorizationService.Operation.READ.toString(), getReaders(),
+                AuthorizationService.Operation.WRITE.toString(), getWriters());
     }
 
     @Override

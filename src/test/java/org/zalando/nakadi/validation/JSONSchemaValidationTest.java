@@ -2,6 +2,7 @@ package org.zalando.nakadi.validation;
 
 import org.json.JSONObject;
 import org.junit.Test;
+import org.zalando.nakadi.domain.CompatibilityMode;
 import org.zalando.nakadi.domain.EventCategory;
 import org.zalando.nakadi.domain.EventType;
 import org.zalando.nakadi.utils.EventTypeTestBuilder;
@@ -10,6 +11,7 @@ import java.util.Arrays;
 import java.util.Optional;
 
 import static org.hamcrest.CoreMatchers.equalTo;
+import static org.hamcrest.Matchers.lessThan;
 import static org.junit.Assert.assertThat;
 import static org.zalando.nakadi.utils.IsOptional.isAbsent;
 import static org.zalando.nakadi.utils.TestUtils.readFile;
@@ -34,6 +36,42 @@ public class JSONSchemaValidationTest {
         final Optional<ValidationError> error = EventValidation.forType(et).validate(event);
 
         assertThat(error.get().getMessage(), equalTo("#: required key [metadata] not found"));
+    }
+
+    @Test
+    public void validationOfBusinessEventShouldAllowSpanCtxtInMetadata() {
+        final EventType et = EventTypeTestBuilder.builder().name("some-event-type")
+                .schema(basicSchema()).compatibilityMode(CompatibilityMode.COMPATIBLE).build();
+        et.setCategory(EventCategory.BUSINESS);
+
+        final JSONObject validEvent = new JSONObject("{\"metadata\":{" +
+                "\"occurred_at\":\"1992-08-03T10:00:00Z\"," +
+                "\"eid\":\"329ed3d2-8366-11e8-adc0-fa7ae01bbebc\"," +
+                "\"span_ctx\": {" +
+                "      \"ot-tracer-spanid\": \"b268f901d5f2b865\"," +
+                "      \"ot-tracer-traceid\": \"e9435c17dabe8238\"," +
+                "      \"ot-baggage-foo\": \"bar\"" +
+                "}}," +
+                "\"foo\": \"bar\"}");
+
+        final Optional<ValidationError> noError = EventValidation.forType(et).validate(validEvent);
+
+        assertThat(noError, isAbsent());
+
+        final JSONObject invalidEvent = new JSONObject("{\"metadata\":{" +
+                "\"occurred_at\":\"1992-08-03T10:00:00Z\"," +
+                "\"eid\":\"329ed3d2-8366-11e8-adc0-fa7ae01bbebc\"," +
+                "\"span_ctx\": {" +
+                "      \"ot-tracer-spanid\": 42," +
+                "      \"ot-tracer-traceid\": \"e9435c17dabe8238\"," +
+                "      \"ot-baggage-foo\": \"bar\"" +
+                "}}," +
+                "\"foo\": \"bar\"}");
+
+        final Optional<ValidationError> error = EventValidation.forType(et).validate(invalidEvent);
+
+        assertThat(error.get().getMessage(),
+                equalTo("#/metadata/span_ctx/ot-tracer-spanid: expected type: String, found: Integer"));
     }
 
     @Test
@@ -105,6 +143,22 @@ public class JSONSchemaValidationTest {
     }
 
     @Test
+    public void requirePatternMatchingToBeFast() {
+        final EventType et = EventTypeTestBuilder.builder().name("some-event-type").schema(patternSchema()).build();
+        et.setCategory(EventCategory.UNDEFINED);
+
+        final long startTime = System.currentTimeMillis();
+
+        final JSONObject event = undefinedEvent();
+        final Optional<ValidationError> error = EventValidation.forType(et).validate(event);
+
+        final long duration = System.currentTimeMillis() - startTime;
+
+        assertThat(error, isAbsent());
+        assertThat(duration, lessThan(100L));
+    }
+
+    @Test
     public void acceptsDefinitionsOnDataChangeEvents() throws Exception {
         final JSONObject schema = new JSONObject(readFile("product-json-schema.json"));
         final EventType et = EventTypeTestBuilder.builder().name("some-event-type").schema(schema).build();
@@ -131,10 +185,33 @@ public class JSONSchemaValidationTest {
         return schema;
     }
 
+    private JSONObject patternSchema() {
+        final JSONObject schema = new JSONObject();
+        final JSONObject string = new JSONObject();
+        string.put("type", "string");
+        string.put("pattern", "a?a?a?a?a?a?a?a?a?a?a?a?a?a?a?a?a?a?a?a?a?a?a?a?a?a?a?a?aaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+
+        final JSONObject properties = new JSONObject();
+        properties.put("foo", string);
+
+        schema.put("type", "object");
+        schema.put("required", Arrays.asList(new String[]{"foo"}));
+        schema.put("properties", properties);
+
+        return schema;
+    }
+
     private JSONObject businessEvent() {
         final JSONObject event = new JSONObject();
         event.put("foo", "bar");
         event.put("metadata", metadata());
+
+        return event;
+    }
+
+    private JSONObject undefinedEvent() {
+        final JSONObject event = new JSONObject();
+        event.put("foo", "aaaaaaaaaaaaaaaaaaaaaaaaaaaa");
 
         return event;
     }

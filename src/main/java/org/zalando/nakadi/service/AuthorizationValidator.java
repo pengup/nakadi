@@ -1,26 +1,24 @@
 package org.zalando.nakadi.service;
 
 import com.google.common.base.Strings;
-import com.google.common.collect.ImmutableMap;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import org.zalando.nakadi.domain.EventType;
-import org.zalando.nakadi.domain.EventTypeBase;
-import org.zalando.nakadi.domain.EventTypeResource;
-import org.zalando.nakadi.domain.ResourceAuthorization;
-import org.zalando.nakadi.domain.SubscriptionBase;
-import org.zalando.nakadi.exceptions.InternalNakadiException;
-import org.zalando.nakadi.exceptions.UnableProcessException;
+import org.zalando.nakadi.domain.Subscription;
 import org.zalando.nakadi.exceptions.runtime.AccessDeniedException;
+import org.zalando.nakadi.exceptions.runtime.ForbiddenOperationException;
+import org.zalando.nakadi.exceptions.runtime.InternalNakadiException;
 import org.zalando.nakadi.exceptions.runtime.ServiceTemporarilyUnavailableException;
-import org.zalando.nakadi.plugin.api.PluginException;
+import org.zalando.nakadi.exceptions.runtime.UnableProcessException;
+import org.zalando.nakadi.exceptions.runtime.UnprocessableEntityException;
 import org.zalando.nakadi.plugin.api.authz.AuthorizationAttribute;
 import org.zalando.nakadi.plugin.api.authz.AuthorizationService;
 import org.zalando.nakadi.plugin.api.authz.Resource;
+import org.zalando.nakadi.plugin.api.exceptions.AuthorizationInvalidException;
+import org.zalando.nakadi.plugin.api.exceptions.OperationOnResourceNotPermittedException;
+import org.zalando.nakadi.plugin.api.exceptions.PluginException;
 import org.zalando.nakadi.repository.EventTypeRepository;
 
-import javax.annotation.Nullable;
-import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -47,15 +45,11 @@ public class AuthorizationValidator {
         this.adminService = adminService;
     }
 
-    public void validateAuthorization(@Nullable final ResourceAuthorization auth) throws UnableProcessException,
+    public void validateAuthorization(final Resource resource) throws UnableProcessException,
             ServiceTemporarilyUnavailableException {
-        if (auth != null) {
-            final Map<String, List<AuthorizationAttribute>> allAttributes = ImmutableMap.of(
-                    "admins", auth.getAdmins(),
-                    "readers", auth.getReaders(),
-                    "writers", auth.getWriters());
-            checkAuthAttributesAreValid(allAttributes);
-            checkAuthAttributesNoDuplicates(allAttributes);
+        checkAuthorisationForResourceAreValid(resource);
+        if (resource.getAuthorization() != null) {
+            checkAuthAttributesNoDuplicates(resource.getAuthorization());
         }
     }
 
@@ -92,31 +86,27 @@ public class AuthorizationValidator {
         }
     }
 
-    private void checkAuthAttributesAreValid(final Map<String, List<AuthorizationAttribute>> allAttributes)
-            throws UnableProcessException, ServiceTemporarilyUnavailableException {
-        try {
-            final String errorMessage = allAttributes.values().stream()
-                    .flatMap(Collection::stream)
-                    .filter(attr -> !authorizationService.isAuthorizationAttributeValid(attr))
-                    .map(attr -> String.format("authorization attribute %s:%s is invalid",
-                            attr.getDataType(), attr.getValue()))
-                    .collect(Collectors.joining(", "));
+    private void checkAuthorisationForResourceAreValid(final Resource resource)
+            throws UnableProcessException, ServiceTemporarilyUnavailableException, ForbiddenOperationException {
 
-            if (!Strings.isNullOrEmpty(errorMessage)) {
-                throw new UnableProcessException(errorMessage);
-            }
-        } catch (final PluginException e) {
+        try {
+            authorizationService.isAuthorizationForResourceValid(resource);
+        } catch (OperationOnResourceNotPermittedException e) {
+            throw new ForbiddenOperationException(e.getMessage());
+        } catch (AuthorizationInvalidException e) {
+            throw new UnprocessableEntityException(e.getMessage());
+        } catch (PluginException e) {
             throw new ServiceTemporarilyUnavailableException("Error calling authorization plugin", e);
         }
     }
+
 
     public void authorizeEventTypeWrite(final EventType eventType)
             throws AccessDeniedException, ServiceTemporarilyUnavailableException {
         if (eventType.getAuthorization() == null) {
             return;
         }
-        final EventTypeResource resource = new EventTypeResource(
-                eventType.getName(), eventType.getAuthorization());
+        final Resource<EventType> resource = eventType.asResource();
         try {
             final boolean authorized = authorizationService.isAuthorized(
                     AuthorizationService.Operation.WRITE,
@@ -129,13 +119,7 @@ public class AuthorizationValidator {
         }
     }
 
-    public void authorizeEventTypeAdmin(final EventType eventType)
-            throws AccessDeniedException, ServiceTemporarilyUnavailableException {
-        if (eventType.getAuthorization() == null) {
-            return;
-        }
-
-        final Resource resource = new EventTypeResource(eventType.getName(), eventType.getAuthorization());
+    private void authorizeResourceAdmin(final Resource resource) throws AccessDeniedException {
         try {
             if (!authorizationService.isAuthorized(AuthorizationService.Operation.ADMIN, resource)) {
                 if (!adminService.isAdmin(AuthorizationService.Operation.WRITE)) {
@@ -147,24 +131,50 @@ public class AuthorizationValidator {
         }
     }
 
-    public void authorizeStreamRead(final EventType eventType) throws AccessDeniedException {
-        if (eventType.getAuthorization() == null) {
-            return;
-        }
-
-        final Resource resource = new EventTypeResource(eventType.getName(), eventType.getAuthorization());
+    private void authorizeResourceView(final Resource resource) throws AccessDeniedException {
         try {
-            if (!authorizationService.isAuthorized(AuthorizationService.Operation.READ, resource)
-                    && !adminService.hasAllDataAccess(AuthorizationService.Operation.READ)) {
-                throw new AccessDeniedException(AuthorizationService.Operation.READ, resource);
+            if (!(adminService.isAdmin(AuthorizationService.Operation.ADMIN) ||
+                    authorizationService.isAuthorized(AuthorizationService.Operation.VIEW, resource))) {
+                throw new AccessDeniedException(AuthorizationService.Operation.VIEW, resource);
             }
         } catch (final PluginException e) {
             throw new ServiceTemporarilyUnavailableException("Error calling authorization plugin", e);
         }
     }
 
-    public void authorizeSubscriptionRead(final SubscriptionBase subscriptionBase) throws AccessDeniedException {
-        subscriptionBase.getEventTypes().forEach(
+    public void authorizeEventTypeView(final EventType eventType)
+            throws AccessDeniedException, ServiceTemporarilyUnavailableException {
+        authorizeResourceView(eventType.asResource());
+    }
+
+    public void authorizeSubscriptionView(final Subscription subscription)
+            throws AccessDeniedException, ServiceTemporarilyUnavailableException {
+        authorizeResourceView(subscription.asResource());
+    }
+
+    public void authorizeEventTypeAdmin(final EventType eventType)
+            throws AccessDeniedException, ServiceTemporarilyUnavailableException {
+        if (eventType.getAuthorization() == null) {
+            return;
+        }
+        authorizeResourceAdmin(eventType.asResource());
+    }
+
+    public void authorizeStreamRead(final EventType eventType) throws AccessDeniedException {
+        if (eventType.getAuthorization() == null) {
+            return;
+        }
+
+        final Resource resource = eventType.asResource();
+        checkResourceAuthorization(resource);
+    }
+
+    public void authorizeSubscriptionRead(final Subscription subscription) throws AccessDeniedException {
+        if (null != subscription.getAuthorization()) {
+            final Resource resource = subscription.asResource();
+            checkResourceAuthorization(resource);
+        }
+        subscription.getEventTypes().forEach(
                 (eventTypeName) -> {
                     try {
                         eventTypeRepository.findByNameO(eventTypeName).ifPresent(this::authorizeStreamRead);
@@ -175,19 +185,47 @@ public class AuthorizationValidator {
         );
     }
 
-    public void validateAuthorization(final EventType original, final EventTypeBase newEventType)
+    public void authorizeSubscriptionCommit(final Subscription subscription) throws AccessDeniedException {
+        if (null == subscription.getAuthorization()) {
+            return;
+        }
+        final Resource resource = subscription.asResource();
+        checkResourceAuthorization(resource);
+
+    }
+
+    private void checkResourceAuthorization(final Resource resource)
+            throws ServiceTemporarilyUnavailableException, AccessDeniedException {
+        try {
+            if (!authorizationService.isAuthorized(AuthorizationService.Operation.READ, resource)
+                    && !adminService.hasAllDataAccess(AuthorizationService.Operation.READ)) {
+                throw new AccessDeniedException(AuthorizationService.Operation.READ, resource);
+            }
+        } catch (final PluginException e) {
+            throw new ServiceTemporarilyUnavailableException("Error calling authorization plugin", e);
+        }
+    }
+
+    public void authorizeSubscriptionAdmin(final Subscription subscription) throws AccessDeniedException {
+        if (subscription.getAuthorization() == null) {
+            return;
+        }
+        authorizeResourceAdmin(subscription.asResource());
+    }
+
+    public void validateAuthorization(final Resource oldValue, final Resource newValue)
             throws UnableProcessException, ServiceTemporarilyUnavailableException {
-        final ResourceAuthorization originalAuth = original.getAuthorization();
-        final ResourceAuthorization newAuth = newEventType.getAuthorization();
-        if (originalAuth != null && newAuth == null) {
+        final Map<String, List<AuthorizationAttribute>> oldAuth = oldValue.getAuthorization();
+        final Map<String, List<AuthorizationAttribute>> newAuth = newValue.getAuthorization();
+        if (oldAuth != null && newAuth == null) {
             throw new UnableProcessException(
                     "Changing authorization object to `null` is not possible due to existing one");
         }
 
-        if (originalAuth != null && originalAuth.equals(newAuth)) {
+        if (oldAuth != null && oldAuth.equals(newAuth)) {
             return;
         }
 
-        validateAuthorization(newAuth);
+        validateAuthorization(newValue);
     }
 }

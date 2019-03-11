@@ -14,7 +14,10 @@ import org.mockito.ArgumentCaptor;
 import org.springframework.test.web.servlet.ResultActions;
 import org.springframework.test.web.servlet.request.MockHttpServletRequestBuilder;
 import org.zalando.nakadi.config.SecuritySettings;
+import org.zalando.nakadi.domain.Audience;
+import org.zalando.nakadi.domain.CleanupPolicy;
 import org.zalando.nakadi.domain.EnrichmentStrategyDescriptor;
+import org.zalando.nakadi.domain.EventCategory;
 import org.zalando.nakadi.domain.EventType;
 import org.zalando.nakadi.domain.EventTypeBase;
 import org.zalando.nakadi.domain.EventTypeOptions;
@@ -22,23 +25,22 @@ import org.zalando.nakadi.domain.ResourceAuthorization;
 import org.zalando.nakadi.domain.ResourceAuthorizationAttribute;
 import org.zalando.nakadi.domain.Subscription;
 import org.zalando.nakadi.domain.Timeline;
-import org.zalando.nakadi.exceptions.DuplicatedEventTypeNameException;
-import org.zalando.nakadi.exceptions.InternalNakadiException;
-import org.zalando.nakadi.exceptions.InvalidEventTypeException;
-import org.zalando.nakadi.exceptions.NoSuchEventTypeException;
-import org.zalando.nakadi.exceptions.TopicCreationException;
-import org.zalando.nakadi.exceptions.UnableProcessException;
-import org.zalando.nakadi.exceptions.UnprocessableEntityException;
+import org.zalando.nakadi.exceptions.runtime.AccessDeniedException;
+import org.zalando.nakadi.exceptions.runtime.DuplicatedEventTypeNameException;
+import org.zalando.nakadi.exceptions.runtime.InternalNakadiException;
+import org.zalando.nakadi.exceptions.runtime.InvalidEventTypeException;
+import org.zalando.nakadi.exceptions.runtime.NoSuchEventTypeException;
 import org.zalando.nakadi.exceptions.runtime.TopicConfigException;
+import org.zalando.nakadi.exceptions.runtime.TopicCreationException;
+import org.zalando.nakadi.exceptions.runtime.UnableProcessException;
 import org.zalando.nakadi.partitioning.PartitionStrategy;
+import org.zalando.nakadi.plugin.api.authz.AuthorizationService;
 import org.zalando.nakadi.repository.TopicRepository;
 import org.zalando.nakadi.utils.EventTypeTestBuilder;
 import org.zalando.nakadi.utils.TestUtils;
-import org.zalando.problem.MoreStatus;
 import org.zalando.problem.Problem;
 import org.zalando.problem.ThrowableProblem;
 
-import javax.ws.rs.core.Response;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -47,8 +49,6 @@ import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.TimeoutException;
 
-import static javax.ws.rs.core.Response.Status.NOT_FOUND;
-import static javax.ws.rs.core.Response.Status.SERVICE_UNAVAILABLE;
 import static org.hamcrest.Matchers.containsString;
 import static org.junit.Assert.assertEquals;
 import static org.mockito.Matchers.any;
@@ -71,8 +71,14 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 import static org.zalando.nakadi.domain.EventCategory.BUSINESS;
 import static org.zalando.nakadi.utils.TestUtils.buildDefaultEventType;
 import static org.zalando.nakadi.utils.TestUtils.buildTimelineWithTopic;
+import static org.zalando.nakadi.utils.TestUtils.createInvalidEventTypeExceptionProblem;
 import static org.zalando.nakadi.utils.TestUtils.invalidProblem;
 import static org.zalando.nakadi.utils.TestUtils.randomValidEventTypeName;
+import static org.zalando.problem.Status.CONFLICT;
+import static org.zalando.problem.Status.INTERNAL_SERVER_ERROR;
+import static org.zalando.problem.Status.NOT_FOUND;
+import static org.zalando.problem.Status.SERVICE_UNAVAILABLE;
+import static org.zalando.problem.Status.UNPROCESSABLE_ENTITY;
 
 public class EventTypeControllerTest extends EventTypeControllerTestCase {
 
@@ -120,7 +126,17 @@ public class EventTypeControllerTest extends EventTypeControllerTestCase {
     public void whenPostEventTypeThenWarning() throws Exception {
         final EventType eventType = buildDefaultEventType();
         postEventType(eventType).andExpect(status().isCreated()).andExpect(
-                header().string("Warning","299 nakadi \"I am warning you\""));
+                header().string("Warning", "299 nakadi \"I am warning you\""));
+    }
+
+    @Test
+    public void whenPostLogCompactedEventTypeThenWarning() throws Exception {
+        final EventType eventType = buildDefaultEventType();
+        eventType.setCategory(BUSINESS);
+        eventType.setCleanupPolicy(CleanupPolicy.COMPACT);
+        eventType.getSchema().setSchema("{}");
+        postEventType(eventType).andExpect(status().isCreated()).andExpect(
+                header().string("Warning", "299 nakadi \"I am warning you. I am warning you, even more\""));
     }
 
     @Test
@@ -171,6 +187,17 @@ public class EventTypeControllerTest extends EventTypeControllerTestCase {
     }
 
     @Test
+    public void whenPostWithRootElementOfTypeArrayThenReturn422() throws Exception {
+        final Problem expectedProblem = createInvalidEventTypeExceptionProblem("\"type\" of root element in"
+                + " schema can only be \"object\"");
+
+        final String eventType = "{\"category\": \"data\", \"owning_application\": \"blah-app\", \n" +
+                "  \"name\": \"blah-event-type\",\n" +
+                "  \"schema\": {\"type\": \"json_schema\", \"schema\": \"{\\\"type\\\":\\\"array\\\" }\"}}";
+        postETAndExpect422WithProblem(eventType, expectedProblem);
+    }
+
+    @Test
     public void whenPOSTWithInvalidPartitionStrategyThen422() throws Exception {
         final EventType eventType = buildDefaultEventType();
 
@@ -179,19 +206,6 @@ public class EventTypeControllerTest extends EventTypeControllerTestCase {
                 .validate(any());
 
         postEventType(eventType)
-                .andExpect(status().isUnprocessableEntity())
-                .andExpect(content().contentType("application/problem+json"));
-    }
-
-    @Test
-    public void whenPUTWithInvalidPartitionStrategyThen422() throws Exception {
-
-        final EventType eventType = EventTypeTestBuilder.builder()
-                .partitionKeyFields(Lists.newArrayList("invalid_key")).build();
-
-        doReturn(eventType).when(eventTypeRepository).findByName(any());
-
-        putEventType(eventType, eventType.getName())
                 .andExpect(status().isUnprocessableEntity())
                 .andExpect(content().contentType("application/problem+json"));
     }
@@ -215,6 +229,49 @@ public class EventTypeControllerTest extends EventTypeControllerTestCase {
     }
 
     @Test
+    public void whenPUTwithNullAudienceThen422() throws Exception {
+        final EventType eventType = EventTypeTestBuilder.builder()
+                .audience(Audience.BUSINESS_UNIT_INTERNAL)
+                .build();
+
+        final EventType randomEventType = EventTypeTestBuilder.builder()
+                .name(eventType.getName())
+                .createdAt(eventType.getCreatedAt())
+                .build();
+
+        doReturn(eventType).when(eventTypeRepository).findByName(any());
+
+        putEventType(randomEventType, eventType.getName())
+                .andExpect(status().isUnprocessableEntity());
+    }
+
+    @Test
+    public void whenPostUndefinedEventTypeWithCompactCleanupPolicyThen422() throws Exception {
+        final EventType eventType = EventTypeTestBuilder.builder()
+                .cleanupPolicy(CleanupPolicy.COMPACT)
+                .category(EventCategory.UNDEFINED)
+                .build();
+        postEventType(eventType).andExpect(status().isUnprocessableEntity());
+    }
+
+    @Test
+    public void whenPutEventTypeWithChangedCleanupPolicyThen422() throws Exception {
+        final EventType originalEventType = EventTypeTestBuilder.builder()
+                .cleanupPolicy(CleanupPolicy.COMPACT)
+                .build();
+
+        final EventType updatedEventType = EventTypeTestBuilder.builder()
+                .name(originalEventType.getName())
+                .cleanupPolicy(CleanupPolicy.DELETE)
+                .build();
+
+        doReturn(originalEventType).when(eventTypeRepository).findByName(any());
+
+        putEventType(updatedEventType, originalEventType.getName())
+                .andExpect(status().isUnprocessableEntity());
+    }
+
+    @Test
     public void whenPUTthenWarning() throws Exception {
         final EventType eventType = buildDefaultEventType();
         eventType.setPartitionStrategy(PartitionStrategy.RANDOM_STRATEGY);
@@ -229,7 +286,7 @@ public class EventTypeControllerTest extends EventTypeControllerTestCase {
         doReturn(eventType).when(eventTypeRepository).findByName(any());
 
         putEventType(updatedEventType, eventType.getName()).andExpect(
-                header().string("Warning","299 nakadi \"I am warning you\""));
+                header().string("Warning", "299 nakadi \"I am warning you\""));
     }
 
     @Test
@@ -370,7 +427,7 @@ public class EventTypeControllerTest extends EventTypeControllerTestCase {
 
         doThrow(new UnableProcessException("dummy")).when(authorizationValidator).validateAuthorization(any());
 
-        postETAndExpect422WithProblem(eventType, Problem.valueOf(MoreStatus.UNPROCESSABLE_ENTITY, "dummy"));
+        postETAndExpect422WithProblem(eventType, Problem.valueOf(UNPROCESSABLE_ENTITY, "dummy"));
     }
 
     @Test
@@ -401,7 +458,7 @@ public class EventTypeControllerTest extends EventTypeControllerTestCase {
                 ImmutableList.of(new ResourceAuthorizationAttribute("type3", "value3"))));
 
         doReturn(eventType).when(eventTypeRepository).saveEventType(any(EventType.class));
-        when(topicRepository.createTopic(anyInt(), any())).thenReturn(randomUUID.toString());
+        when(topicRepository.createTopic(any())).thenReturn(randomUUID.toString());
 
         postEventType(eventType).andExpect(status().isCreated());
     }
@@ -425,7 +482,7 @@ public class EventTypeControllerTest extends EventTypeControllerTestCase {
                 "{\"type\": \"object\", \"properties\": {\"metadata\": {\"type\": \"object\"} }}");
         eventType.setCategory(BUSINESS);
 
-        final Problem expectedProblem = new InvalidEventTypeException("\"metadata\" property is reserved").asProblem();
+        final Problem expectedProblem = createInvalidEventTypeExceptionProblem("\"metadata\" property is reserved");
 
         postETAndExpect422WithProblem(eventType, expectedProblem);
     }
@@ -437,15 +494,15 @@ public class EventTypeControllerTest extends EventTypeControllerTestCase {
                 "{\"not\": {\"type\": \"object\"} }");
         eventType.setCategory(BUSINESS);
 
-        final Problem expectedProblem = new InvalidEventTypeException("Invalid schema: Invalid schema found in [#]: " +
-                "extraneous key [not] is not permitted").asProblem();
+        final Problem expectedProblem = createInvalidEventTypeExceptionProblem("Invalid schema: Invalid schema found " +
+                "in [#]: extraneous key [not] is not permitted");
 
         postETAndExpect422WithProblem(eventType, expectedProblem);
     }
 
     @Test
     public void whenPostDuplicatedEventTypeReturn409() throws Exception {
-        final Problem expectedProblem = Problem.valueOf(Response.Status.CONFLICT, "some-name");
+        final Problem expectedProblem = Problem.valueOf(CONFLICT, "some-name");
 
         doThrow(new DuplicatedEventTypeNameException("some-name")).when(eventTypeRepository).saveEventType(any(
                 EventTypeBase.class));
@@ -515,7 +572,7 @@ public class EventTypeControllerTest extends EventTypeControllerTestCase {
                 .listSubscriptions(eq(ImmutableSet.of(eventType.getName())), eq(Optional.empty()), anyInt(), anyInt()))
                 .thenReturn(ImmutableList.of(mock(Subscription.class)));
 
-        final Problem expectedProblem = Problem.valueOf(Response.Status.CONFLICT,
+        final Problem expectedProblem = Problem.valueOf(CONFLICT,
                 "Can't remove event type " + eventType.getName() + ", as it has subscriptions");
 
         deleteEventType(eventType.getName())
@@ -525,62 +582,10 @@ public class EventTypeControllerTest extends EventTypeControllerTestCase {
     }
 
     @Test
-    public void whenCreateEventTypeWithWrongPartitionKeyFieldsThen422() throws Exception {
-
-        final EventType eventType = EventTypeTestBuilder.builder()
-                .partitionKeyFields(Collections.singletonList("blabla")).build();
-
-        doReturn(eventType).when(eventTypeRepository).findByName(eventType.getName());
-
-        postEventType(eventType).andExpect(status().isUnprocessableEntity())
-                .andExpect(content().contentType("application/problem+json"));
-    }
-
-    @Test
-    public void whenCreateEventTypeWithUnknownApplicationThen422() throws Exception {
-
-        doReturn(false).when(applicationService).exists(any());
-
-        final EventType eventType = EventTypeTestBuilder.builder()
-                .partitionKeyFields(Collections.singletonList("blabla")).build();
-
-        doReturn(eventType).when(eventTypeRepository).findByName(eventType.getName());
-
-        postEventType(eventType).andExpect(status().isUnprocessableEntity())
-                .andExpect(content().contentType("application/problem+json"));
-    }
-
-    @Test
-    public void whenPUTEventTypeWithWrongPartitionKeyFieldsThen422() throws Exception {
-
-        final EventType eventType = EventTypeTestBuilder.builder()
-                .partitionKeyFields(Collections.singletonList("blabla")).build();
-
-        doReturn(eventType).when(eventTypeRepository).findByName(eventType.getName());
-
-        putEventType(eventType, eventType.getName()).andExpect(status().isUnprocessableEntity())
-                .andExpect(content().contentType("application/problem+json"));
-    }
-
-    @Test
-    public void whenPUTEventTypeWithWrongPartitionKeyToBusinessCategoryFieldsThen422() throws Exception {
-
-        final EventType eventType = EventTypeTestBuilder.builder()
-                .partitionKeyFields(Collections.singletonList("blabla"))
-                .category(BUSINESS)
-                .build();
-
-        doReturn(eventType).when(eventTypeRepository).findByName(eventType.getName());
-
-        putEventType(eventType, eventType.getName()).andExpect(status().isUnprocessableEntity())
-                .andExpect(content().contentType("application/problem+json"));
-    }
-
-    @Test
     public void whenDeleteEventTypeAndNakadiExceptionThen500() throws Exception {
 
         final String eventTypeName = randomValidEventTypeName();
-        final Problem expectedProblem = Problem.valueOf(Response.Status.INTERNAL_SERVER_ERROR,
+        final Problem expectedProblem = Problem.valueOf(INTERNAL_SERVER_ERROR,
                 "Failed to delete event type " + eventTypeName);
 
         doThrow(new InternalNakadiException("dummy message"))
@@ -595,7 +600,7 @@ public class EventTypeControllerTest extends EventTypeControllerTestCase {
 
     @Test
     public void whenPersistencyErrorThen500() throws Exception {
-        final Problem expectedProblem = Problem.valueOf(Response.Status.INTERNAL_SERVER_ERROR);
+        final Problem expectedProblem = Problem.valueOf(INTERNAL_SERVER_ERROR);
 
         doThrow(InternalNakadiException.class).when(eventTypeRepository).saveEventType(any(EventType.class));
 
@@ -608,13 +613,13 @@ public class EventTypeControllerTest extends EventTypeControllerTestCase {
     public void whenCreateSuccessfullyThen201() throws Exception {
         final EventType et = buildDefaultEventType();
         final Timeline timeline = buildTimelineWithTopic("topic1");
-        when(timelineService.createDefaultTimeline(anyString(), anyInt(), anyLong())).thenReturn(timeline);
+        when(timelineService.createDefaultTimeline(any(), anyInt())).thenReturn(timeline);
         doReturn(et).when(eventTypeRepository).saveEventType(any(EventType.class));
 
         postEventType(et).andExpect(status().isCreated()).andExpect(content().string(""));
 
         verify(eventTypeRepository, times(1)).saveEventType(any(EventType.class));
-        verify(timelineService, times(1)).createDefaultTimeline(anyString(), anyInt(), anyLong());
+        verify(timelineService, times(1)).createDefaultTimeline(any(), anyInt());
     }
 
     @Test
@@ -622,7 +627,7 @@ public class EventTypeControllerTest extends EventTypeControllerTestCase {
 
         final EventType et = buildDefaultEventType();
         doThrow(TopicCreationException.class).when(timelineService)
-                .createDefaultTimeline(anyString(), anyInt(), anyLong());
+                .createDefaultTimeline(any(), anyInt());
         final Problem expectedProblem = Problem.valueOf(SERVICE_UNAVAILABLE);
 
         postEventType(et).andExpect(status().isServiceUnavailable())
@@ -630,7 +635,7 @@ public class EventTypeControllerTest extends EventTypeControllerTestCase {
                 matchesProblem(expectedProblem)));
 
         verify(eventTypeRepository, times(1)).saveEventType(any(EventType.class));
-        verify(timelineService, times(1)).createDefaultTimeline(anyString(), anyInt(), anyLong());
+        verify(timelineService, times(1)).createDefaultTimeline(any(), anyInt());
         verify(eventTypeRepository, times(1)).removeEventType(et.getName());
     }
 
@@ -656,7 +661,7 @@ public class EventTypeControllerTest extends EventTypeControllerTestCase {
         final String eventTypeName = eventType.getName();
         eventType.setName("event-name-different");
 
-        final Problem expectedProblem = new InvalidEventTypeException("path does not match resource name").asProblem();
+        final Problem expectedProblem = createInvalidEventTypeExceptionProblem("path does not match resource name");
 
         doReturn(eventType).when(eventTypeRepository).findByName(eventTypeName);
 
@@ -674,19 +679,6 @@ public class EventTypeControllerTest extends EventTypeControllerTestCase {
         doThrow(NoSuchEventTypeException.class).when(eventTypeRepository).findByName(eventType.getName());
 
         putEventType(eventType, eventType.getName()).andExpect(status().isNotFound())
-                .andExpect(content().contentType("application/problem+json"))
-                .andExpect(content().string(matchesProblem(expectedProblem)));
-    }
-
-    @Test
-    public void whenPUTRepoNakadiExceptionThen422() throws Exception {
-        final EventType eventType = buildDefaultEventType();
-
-        final Problem expectedProblem = Problem.valueOf(MoreStatus.UNPROCESSABLE_ENTITY);
-
-        doThrow(UnprocessableEntityException.class).when(eventTypeRepository).findByName(eventType.getName());
-
-        putEventType(eventType, eventType.getName()).andExpect(status().isUnprocessableEntity())
                 .andExpect(content().contentType("application/problem+json"))
                 .andExpect(content().string(matchesProblem(expectedProblem)));
     }
@@ -730,8 +722,7 @@ public class EventTypeControllerTest extends EventTypeControllerTestCase {
         eventType.getSchema().setSchema("invalid-json");
 
         final Problem expectedProblem =
-                new InvalidEventTypeException(
-                        "schema must be a valid json: Unexpected token 'invalid' on line 1, char 1").asProblem();
+                createInvalidEventTypeExceptionProblem("schema must be a valid json: Unexpected symbol 'i' at pos 1");
 
         postETAndExpect422WithProblem(eventType, expectedProblem);
     }
@@ -744,7 +735,7 @@ public class EventTypeControllerTest extends EventTypeControllerTestCase {
                 Charsets.UTF_8);
         eventType.getSchema().setSchema(jsonSchemaString);
 
-        final Problem expectedProblem = new InvalidEventTypeException("schema must be a valid json-schema").asProblem();
+        final Problem expectedProblem = createInvalidEventTypeExceptionProblem("schema must be a valid json-schema");
 
         postETAndExpect422WithProblem(eventType, expectedProblem);
     }
@@ -937,4 +928,13 @@ public class EventTypeControllerTest extends EventTypeControllerTestCase {
         verify(eventTypeRepository).update(any());
     }
 
+    @Test
+    public void testGetEventTypeWhenViewAccessForbidden() throws Exception {
+        final EventType eventType = buildDefaultEventType();
+        final String eventTypeName = eventType.getName();
+        when(eventTypeRepository.findByName(any())).thenReturn(eventType);
+        doThrow(new AccessDeniedException(AuthorizationService.Operation.VIEW, eventType.asResource()))
+                .when(authorizationValidator).authorizeEventTypeView(eventType);
+        getEventType(eventTypeName).andExpect(status().isForbidden());
+    }
 }

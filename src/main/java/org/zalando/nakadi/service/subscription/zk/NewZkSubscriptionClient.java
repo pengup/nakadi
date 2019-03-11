@@ -1,12 +1,15 @@
 package org.zalando.nakadi.service.subscription.zk;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.google.common.collect.ImmutableList;
 import org.apache.curator.framework.CuratorFramework;
 import org.apache.zookeeper.KeeperException;
 import org.zalando.nakadi.domain.EventTypePartition;
-import org.zalando.nakadi.exceptions.NakadiRuntimeException;
+import org.zalando.nakadi.exceptions.runtime.NakadiRuntimeException;
 import org.zalando.nakadi.exceptions.runtime.ServiceTemporarilyUnavailableException;
 import org.zalando.nakadi.service.subscription.model.Partition;
+import org.zalando.nakadi.service.subscription.model.Session;
 import org.zalando.nakadi.view.SubscriptionCursorWithoutToken;
 
 import java.io.IOException;
@@ -14,6 +17,7 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 import static com.google.common.base.Charsets.UTF_8;
@@ -134,6 +138,30 @@ public class NewZkSubscriptionClient extends AbstractZkSubscriptionClient {
                 getSubscriptionPath(NODE_TOPOLOGY));
     }
 
+    protected byte[] serializeSession(final Session session)
+            throws NakadiRuntimeException {
+        try {
+            return objectMapper.writeValueAsBytes(session);
+        } catch (final JsonProcessingException e) {
+            throw new NakadiRuntimeException(e);
+        }
+    }
+
+    protected Session deserializeSession(final String sessionId, final byte[] sessionZkData)
+            throws NakadiRuntimeException {
+        try {
+            // old version of session: zkNode data is session weight
+            final int weight = Integer.parseInt(new String(sessionZkData, UTF_8));
+            return new Session(sessionId, weight, ImmutableList.of());
+        } catch (final NumberFormatException nfe) {
+            // new version of session: zkNode data is session object as json
+            try {
+                return objectMapper.readValue(sessionZkData, Session.class);
+            } catch (final IOException e) {
+                throw new NakadiRuntimeException(e);
+            }
+        }
+    }
 
     protected String getOffsetPath(final EventTypePartition etp) {
         return getSubscriptionPath("/offsets/" + etp.getEventType() + "/" + etp.getPartition());
@@ -143,8 +171,21 @@ public class NewZkSubscriptionClient extends AbstractZkSubscriptionClient {
     public Map<EventTypePartition, SubscriptionCursorWithoutToken> getOffsets(
             final Collection<EventTypePartition> keys)
             throws NakadiRuntimeException, ServiceTemporarilyUnavailableException {
-        return loadDataAsync(keys, this::getOffsetPath, (etp, value) ->
-                new SubscriptionCursorWithoutToken(etp.getEventType(), etp.getPartition(), new String(value, UTF_8)));
+        final Map<EventTypePartition, SubscriptionCursorWithoutToken> offSets = loadDataAsync(keys,
+                this::getOffsetPath, (etp, value) ->
+                        new SubscriptionCursorWithoutToken(etp.getEventType(), etp.getPartition(),
+                                new String(value, UTF_8)));
+
+        if (offSets.size() != keys.size()) {
+            throw new ServiceTemporarilyUnavailableException("Failed to get all the keys " +
+                    keys.stream()
+                            .filter(v -> !offSets.containsKey(v))
+                            .map(String::valueOf)
+                            .collect(Collectors.joining(", "))
+                    + " from ZK.", null);
+        }
+
+        return offSets;
     }
 
     @Override

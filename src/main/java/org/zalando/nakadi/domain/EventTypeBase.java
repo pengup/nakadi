@@ -1,8 +1,11 @@
 package org.zalando.nakadi.domain;
 
 import com.fasterxml.jackson.annotation.JsonIgnore;
+import com.fasterxml.jackson.annotation.JsonInclude;
 import com.google.common.collect.ImmutableList;
 import org.zalando.nakadi.partitioning.PartitionStrategy;
+import org.zalando.nakadi.plugin.api.authz.EventTypeAuthz;
+import org.zalando.nakadi.plugin.api.authz.Resource;
 
 import javax.annotation.Nullable;
 import javax.validation.Valid;
@@ -14,9 +17,10 @@ import java.util.List;
 
 import static java.util.Collections.unmodifiableList;
 
-public class EventTypeBase {
+public class EventTypeBase implements EventTypeAuthz {
 
     private static final List<String> EMPTY_PARTITION_KEY_FIELDS = ImmutableList.of();
+    private static final List<String> EMPTY_ORDERING_KEY_FIELDS = ImmutableList.of();
 
     @NotNull
     @Pattern(regexp = "[a-zA-Z][-0-9a-zA-Z_]*(\\.[0-9a-zA-Z][-0-9a-zA-Z_]*)*", message = "format not allowed")
@@ -40,6 +44,15 @@ public class EventTypeBase {
     @Nullable
     private List<String> partitionKeyFields;
 
+    @NotNull
+    private CleanupPolicy cleanupPolicy;
+
+    @Nullable
+    private List<String> orderingKeyFields;
+
+    @Nullable
+    private List<String> orderingInstanceIds;
+
     @Valid
     @NotNull
     private EventTypeSchemaBase schema;
@@ -57,23 +70,31 @@ public class EventTypeBase {
     @NotNull
     private CompatibilityMode compatibilityMode;
 
+    @Nullable
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    private Audience audience;
+
     public EventTypeBase() {
         this.validationStrategies = Collections.emptyList();
         this.enrichmentStrategies = Collections.emptyList();
         this.partitionStrategy = PartitionStrategy.RANDOM_STRATEGY;
         this.options = new EventTypeOptions();
         this.compatibilityMode = CompatibilityMode.FORWARD;
+        this.cleanupPolicy = CleanupPolicy.DELETE;
     }
 
-    public EventTypeBase(final String name, final String owningApplication,
-                     final EventCategory category,
-                     final List<ValidationStrategyConfiguration> validationStrategies,
-                     final List<EnrichmentStrategyDescriptor> enrichmentStrategies,
-                     final String partitionStrategy,
-                     final List<String> partitionKeyFields, final EventTypeSchemaBase schema,
-                     final EventTypeStatistics defaultStatistic,
-                     final EventTypeOptions options,
-                     final CompatibilityMode compatibilityMode) {
+    public EventTypeBase(final String name,
+                         final String owningApplication,
+                         final EventCategory category,
+                         final List<ValidationStrategyConfiguration> validationStrategies,
+                         final List<EnrichmentStrategyDescriptor> enrichmentStrategies,
+                         final String partitionStrategy,
+                         final List<String> partitionKeyFields,
+                         final EventTypeSchemaBase schema,
+                         final EventTypeStatistics defaultStatistic,
+                         final EventTypeOptions options,
+                         final CompatibilityMode compatibilityMode,
+                         final CleanupPolicy cleanupPolicy) {
         this.name = name;
         this.owningApplication = owningApplication;
         this.category = category;
@@ -85,6 +106,7 @@ public class EventTypeBase {
         this.defaultStatistic = defaultStatistic;
         this.options = options;
         this.compatibilityMode = compatibilityMode;
+        this.cleanupPolicy = cleanupPolicy;
     }
 
     public EventTypeBase(final EventTypeBase eventType) {
@@ -100,6 +122,10 @@ public class EventTypeBase {
         this.setOptions(eventType.getOptions());
         this.setCompatibilityMode(eventType.getCompatibilityMode());
         this.setAuthorization(eventType.getAuthorization());
+        this.setAudience(eventType.getAudience());
+        this.setOrderingKeyFields(eventType.getOrderingKeyFields());
+        this.setOrderingInstanceIds(eventType.getOrderingInstanceIds());
+        this.setCleanupPolicy(eventType.getCleanupPolicy());
     }
 
     public String getName() {
@@ -162,6 +188,30 @@ public class EventTypeBase {
         this.partitionKeyFields = partitionKeyFields;
     }
 
+    public CleanupPolicy getCleanupPolicy() {
+        return cleanupPolicy;
+    }
+
+    public void setCleanupPolicy(final CleanupPolicy cleanupPolicy) {
+        this.cleanupPolicy = cleanupPolicy;
+    }
+
+    public List<String> getOrderingKeyFields() {
+        return unmodifiableList(orderingKeyFields != null ? orderingKeyFields : EMPTY_ORDERING_KEY_FIELDS);
+    }
+
+    public void setOrderingKeyFields(@Nullable final List<String> orderingKeyFields) {
+        this.orderingKeyFields = orderingKeyFields;
+    }
+
+    public List<String> getOrderingInstanceIds() {
+        return unmodifiableList(orderingInstanceIds != null ? orderingInstanceIds : EMPTY_ORDERING_KEY_FIELDS);
+    }
+
+    public void setOrderingInstanceIds(@Nullable final List<String> orderingInstanceIds) {
+        this.orderingInstanceIds = orderingInstanceIds;
+    }
+
     public List<EnrichmentStrategyDescriptor> getEnrichmentStrategies() {
         return enrichmentStrategies;
     }
@@ -195,7 +245,33 @@ public class EventTypeBase {
         return authorization;
     }
 
+    @Nullable
+    public Audience getAudience() {
+        return audience;
+    }
+
+    public void setAudience(@Nullable final Audience audience) {
+        this.audience = audience;
+    }
+
     public void setAuthorization(final ResourceAuthorization authorization) {
         this.authorization = authorization;
+    }
+
+    @JsonIgnore
+    @Override
+    public String getAuthCompatibilityMode() {
+        return this.compatibilityMode.toString();
+    }
+
+    @JsonIgnore
+    @Override
+    public String getAuthCleanupPolicy() {
+        return this.cleanupPolicy.toString();
+    }
+
+    @JsonIgnore
+    public Resource<EventTypeBase> asBaseResource() {
+        return new ResourceImpl<>(getName(), ResourceImpl.EVENT_TYPE_RESOURCE, getAuthorization(), this);
     }
 }

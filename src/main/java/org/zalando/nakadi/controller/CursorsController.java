@@ -4,8 +4,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.ResponseEntity;
-import org.springframework.web.bind.MethodArgumentNotValidException;
-import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestHeader;
@@ -15,33 +13,25 @@ import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.context.request.NativeWebRequest;
 import org.zalando.nakadi.domain.ItemsWrapper;
 import org.zalando.nakadi.domain.NakadiCursor;
-import org.zalando.nakadi.exceptions.InternalNakadiException;
-import org.zalando.nakadi.exceptions.InvalidCursorException;
-import org.zalando.nakadi.exceptions.InvalidStreamIdException;
-import org.zalando.nakadi.exceptions.NakadiException;
-import org.zalando.nakadi.exceptions.NakadiRuntimeException;
-import org.zalando.nakadi.exceptions.NoSuchEventTypeException;
-import org.zalando.nakadi.exceptions.ServiceUnavailableException;
-import org.zalando.nakadi.exceptions.UnableProcessException;
+import org.zalando.nakadi.exceptions.runtime.BlockedException;
 import org.zalando.nakadi.exceptions.runtime.CursorsAreEmptyException;
-import org.zalando.nakadi.exceptions.runtime.FeatureNotAvailableException;
-import org.zalando.nakadi.exceptions.runtime.RequestInProgressException;
-import org.zalando.nakadi.problem.ValidationProblem;
+import org.zalando.nakadi.exceptions.runtime.InternalNakadiException;
+import org.zalando.nakadi.exceptions.runtime.InvalidCursorException;
+import org.zalando.nakadi.exceptions.runtime.NakadiRuntimeException;
+import org.zalando.nakadi.exceptions.runtime.NoSuchEventTypeException;
+import org.zalando.nakadi.exceptions.runtime.NoSuchSubscriptionException;
+import org.zalando.nakadi.exceptions.runtime.ServiceTemporarilyUnavailableException;
+import org.zalando.nakadi.security.Client;
+import org.zalando.nakadi.service.BlacklistService;
 import org.zalando.nakadi.service.CursorConverter;
 import org.zalando.nakadi.service.CursorTokenService;
 import org.zalando.nakadi.service.CursorsService;
-import org.zalando.nakadi.service.FeatureToggleService;
-import org.zalando.nakadi.util.TimeLogger;
 import org.zalando.nakadi.view.CursorCommitResult;
 import org.zalando.nakadi.view.SubscriptionCursor;
 import org.zalando.nakadi.view.SubscriptionCursorWithoutToken;
-import org.zalando.problem.MoreStatus;
-import org.zalando.problem.Problem;
-import org.zalando.problem.spring.web.advice.Responses;
 
 import javax.validation.Valid;
 import javax.validation.constraints.NotNull;
-import javax.ws.rs.core.Response;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.stream.Collectors;
@@ -49,9 +39,6 @@ import java.util.stream.IntStream;
 
 import static org.springframework.http.ResponseEntity.noContent;
 import static org.springframework.http.ResponseEntity.ok;
-import static org.zalando.nakadi.service.FeatureToggleService.Feature.HIGH_LEVEL_API;
-import static org.zalando.problem.MoreStatus.UNPROCESSABLE_ENTITY;
-import static org.zalando.problem.spring.web.advice.Responses.create;
 
 @RestController
 public class CursorsController {
@@ -59,31 +46,34 @@ public class CursorsController {
     private static final Logger LOG = LoggerFactory.getLogger(CursorsController.class);
 
     private final CursorsService cursorsService;
-    private final FeatureToggleService featureToggleService;
     private final CursorConverter cursorConverter;
     private final CursorTokenService cursorTokenService;
+    private final BlacklistService blacklistService;
 
     @Autowired
     public CursorsController(final CursorsService cursorsService,
-                             final FeatureToggleService featureToggleService,
                              final CursorConverter cursorConverter,
-                             final CursorTokenService cursorTokenService) {
+                             final CursorTokenService cursorTokenService,
+                             final BlacklistService blacklistService) {
         this.cursorsService = cursorsService;
-        this.featureToggleService = featureToggleService;
         this.cursorConverter = cursorConverter;
         this.cursorTokenService = cursorTokenService;
+        this.blacklistService = blacklistService;
     }
 
     @RequestMapping(path = "/subscriptions/{subscriptionId}/cursors", method = RequestMethod.GET)
-    public ItemsWrapper<SubscriptionCursor> getCursors(@PathVariable("subscriptionId") final String subscriptionId) {
-        featureToggleService.checkFeatureOn(HIGH_LEVEL_API);
+    public ItemsWrapper<SubscriptionCursor> getCursors(@PathVariable("subscriptionId") final String subscriptionId,
+                                                       final Client client) {
         try {
+            if (blacklistService.isSubscriptionConsumptionBlocked(subscriptionId, client.getClientId())) {
+                throw new BlockedException("Application or subscription is blocked");
+            }
             final List<SubscriptionCursor> cursors = cursorsService.getSubscriptionCursors(subscriptionId)
                     .stream()
                     .map(cursor -> cursor.withToken(cursorTokenService.generateToken()))
                     .collect(Collectors.toList());
             return new ItemsWrapper<>(cursors);
-        } catch (final NakadiException e) {
+        } catch (final InternalNakadiException e) {
             throw new NakadiRuntimeException(e);
         }
     }
@@ -92,41 +82,31 @@ public class CursorsController {
     public ResponseEntity<?> commitCursors(@PathVariable("subscriptionId") final String subscriptionId,
                                            @Valid @RequestBody final ItemsWrapper<SubscriptionCursor> cursorsIn,
                                            @NotNull @RequestHeader("X-Nakadi-StreamId") final String streamId,
-                                           final NativeWebRequest request) {
+                                           final Client client)
+            throws NoSuchEventTypeException,
+            NoSuchSubscriptionException,
+            InvalidCursorException,
+            ServiceTemporarilyUnavailableException,
+            InternalNakadiException {
+        final List<NakadiCursor> cursors = convertToNakadiCursors(cursorsIn);
+        if (cursors.isEmpty()) {
+            throw new CursorsAreEmptyException();
+        }
 
-        TimeLogger.startMeasure(
-                "COMMIT_CURSORS sid:" + subscriptionId + ", size=" + cursorsIn.getItems().size(),
-                "isFeatureEnabled");
-        try {
-            featureToggleService.checkFeatureOn(HIGH_LEVEL_API);
+        if (blacklistService.isSubscriptionConsumptionBlocked(subscriptionId, client.getClientId())) {
+            throw new BlockedException("Application or subscription is blocked");
+        }
 
-            try {
-                TimeLogger.addMeasure("convertToNakadiCursors");
-                final List<NakadiCursor> cursors = convertToNakadiCursors(cursorsIn);
-                if (cursors.isEmpty()) {
-                    throw new CursorsAreEmptyException();
-                }
-                TimeLogger.addMeasure("callService");
-                final List<Boolean> items = cursorsService.commitCursors(streamId, subscriptionId, cursors);
+        final List<Boolean> items = cursorsService.commitCursors(streamId, subscriptionId, cursors);
 
-                TimeLogger.addMeasure("prepareResponse");
-                final boolean allCommited = items.stream().allMatch(item -> item);
-                if (allCommited) {
-                    return noContent().build();
-                } else {
-                    final List<CursorCommitResult> body = IntStream.range(0, cursorsIn.getItems().size())
-                            .mapToObj(idx -> new CursorCommitResult(cursorsIn.getItems().get(idx), items.get(idx)))
-                            .collect(Collectors.toList());
-                    return ok(new ItemsWrapper<>(body));
-                }
-            } catch (final NoSuchEventTypeException | InvalidCursorException e) {
-                return create(Problem.valueOf(UNPROCESSABLE_ENTITY, e.getMessage()), request);
-            } catch (final NakadiException e) {
-                LOG.error("Failed to commit cursors", e);
-                return create(e.asProblem(), request);
-            }
-        } finally {
-            LOG.info(TimeLogger.finishMeasure());
+        final boolean allCommited = items.stream().allMatch(item -> item);
+        if (allCommited) {
+            return noContent().build();
+        } else {
+            final List<CursorCommitResult> body = IntStream.range(0, cursorsIn.getItems().size())
+                    .mapToObj(idx -> new CursorCommitResult(cursorsIn.getItems().get(idx), items.get(idx)))
+                    .collect(Collectors.toList());
+            return ok(new ItemsWrapper<>(body));
         }
     }
 
@@ -134,63 +114,25 @@ public class CursorsController {
     public ResponseEntity<?> resetCursors(
             @PathVariable("subscriptionId") final String subscriptionId,
             @Valid @RequestBody final ItemsWrapper<SubscriptionCursorWithoutToken> cursors,
-            final NativeWebRequest request) {
-        featureToggleService.checkFeatureOn(HIGH_LEVEL_API);
-        try {
-            cursorsService.resetCursors(subscriptionId, convertToNakadiCursors(cursors));
-            return noContent().build();
-        } catch (final NoSuchEventTypeException e) {
-            throw new UnableProcessException(e.getMessage());
-        } catch (final InvalidCursorException e) {
-            return create(Problem.valueOf(UNPROCESSABLE_ENTITY, e.getMessage()), request);
-        } catch (final NakadiException e) {
-            return create(e.asProblem(), request);
+            final NativeWebRequest request,
+            final Client client)
+            throws NoSuchEventTypeException, InvalidCursorException, InternalNakadiException {
+        if (blacklistService.isSubscriptionConsumptionBlocked(subscriptionId, client.getClientId())) {
+            throw new BlockedException("Application or subscription is blocked");
         }
+
+        cursorsService.resetCursors(subscriptionId, convertToNakadiCursors(cursors));
+        return noContent().build();
     }
 
     private List<NakadiCursor> convertToNakadiCursors(
             final ItemsWrapper<? extends SubscriptionCursorWithoutToken> cursors) throws
-            InternalNakadiException, NoSuchEventTypeException, ServiceUnavailableException, InvalidCursorException {
+            InternalNakadiException, NoSuchEventTypeException, ServiceTemporarilyUnavailableException,
+            InvalidCursorException {
         final List<NakadiCursor> nakadiCursors = new ArrayList<>();
         for (final SubscriptionCursorWithoutToken cursor : cursors.getItems()) {
             nakadiCursors.add(cursorConverter.convert(cursor));
         }
         return nakadiCursors;
     }
-
-    @ExceptionHandler(InvalidStreamIdException.class)
-    public ResponseEntity<Problem> handleInvalidStreamId(final InvalidStreamIdException ex,
-                                                         final NativeWebRequest request) {
-        LOG.warn("Stream id {} is not found: {}", ex.getStreamId(), ex.getMessage());
-        return Responses.create(MoreStatus.UNPROCESSABLE_ENTITY, ex.getMessage(), request);
-    }
-
-    @ExceptionHandler(UnableProcessException.class)
-    public ResponseEntity<Problem> handleUnableProcessException(final RuntimeException ex,
-                                                                final NativeWebRequest request) {
-        LOG.debug(ex.getMessage(), ex);
-        return Responses.create(Response.Status.SERVICE_UNAVAILABLE, ex.getMessage(), request);
-    }
-
-    @ExceptionHandler(RequestInProgressException.class)
-    public ResponseEntity<Problem> handleRequestInProgressException(final RequestInProgressException ex,
-                                                                    final NativeWebRequest request) {
-        LOG.debug(ex.getMessage(), ex);
-        return Responses.create(Response.Status.CONFLICT, ex.getMessage(), request);
-    }
-
-    @ExceptionHandler(MethodArgumentNotValidException.class)
-    public ResponseEntity<Problem> handleMethodArgumentNotValidException(final MethodArgumentNotValidException ex,
-                                                                         final NativeWebRequest request) {
-        LOG.debug(ex.getMessage(), ex);
-        return Responses.create(new ValidationProblem(ex.getBindingResult()), request);
-    }
-
-    @ExceptionHandler(FeatureNotAvailableException.class)
-    public ResponseEntity<Problem> handleFeatureNotAllowed(final FeatureNotAvailableException ex,
-                                                           final NativeWebRequest request) {
-        LOG.debug(ex.getMessage(), ex);
-        return Responses.create(Problem.valueOf(Response.Status.NOT_IMPLEMENTED, "Feature is disabled"), request);
-    }
-
 }

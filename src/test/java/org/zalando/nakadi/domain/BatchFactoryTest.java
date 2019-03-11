@@ -100,6 +100,24 @@ public class BatchFactoryTest {
     }
 
     @Test
+    public void testNoCommaBetweenEvents1() {
+        final String events = "[{\"name\":\"MyEvent\"}        {\"name\":\"MyOtherEvent\"}]";
+        final List<BatchItem> batch = BatchFactory.from(events);
+        assertEquals(2, batch.size());
+        assertEquals("{\"name\":\"MyEvent\"}", batch.get(0).getEvent().toString());
+        assertEquals("{\"name\":\"MyOtherEvent\"}", batch.get(1).getEvent().toString());
+    }
+
+    @Test
+    public void testNoCommaBetweenEvents2() {
+        final String events = "[{\"name\":\"MyEvent\"}{\"name\":\"MyOtherEvent\"}]";
+        final List<BatchItem> batch = BatchFactory.from(events);
+        assertEquals(2, batch.size());
+        assertEquals("{\"name\":\"MyEvent\"}", batch.get(0).getEvent().toString());
+        assertEquals("{\"name\":\"MyOtherEvent\"}", batch.get(1).getEvent().toString());
+    }
+
+    @Test
     public void testEmptyCharactersAroundArray() {
         final String events = "\t [{\"name\":\"MyEvent\"},{\"name\":\"MyOtherEvent\"}]\n\n";
         final List<BatchItem> batch = BatchFactory.from(events);
@@ -113,5 +131,11 @@ public class BatchFactoryTest {
             BatchFactory.from(events);
             fail();
         } catch (JSONException e) {}
+    }
+
+    @Test(expected = JSONException.class)
+    public void testNumberLargerThanMaxLongInEvents() {
+        final String events = "[{\"number\": 9223372036854775808 }]";
+        BatchFactory.from(events);
     }
 }

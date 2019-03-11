@@ -11,12 +11,15 @@ import org.zalando.nakadi.domain.EventType;
 import org.zalando.nakadi.domain.NakadiCursor;
 import org.zalando.nakadi.domain.Subscription;
 import org.zalando.nakadi.domain.Timeline;
-import org.zalando.nakadi.exceptions.InvalidStreamIdException;
+import org.zalando.nakadi.exceptions.runtime.InvalidStreamIdException;
 import org.zalando.nakadi.repository.TopicRepository;
 import org.zalando.nakadi.repository.db.SubscriptionDbRepository;
 import org.zalando.nakadi.repository.zookeeper.ZooKeeperHolder;
+import org.zalando.nakadi.service.AuthorizationValidator;
 import org.zalando.nakadi.service.CursorConverter;
 import org.zalando.nakadi.service.CursorsService;
+import org.zalando.nakadi.service.NakadiAuditLogPublisher;
+import org.zalando.nakadi.service.SubscriptionCache;
 import org.zalando.nakadi.service.subscription.model.Partition;
 import org.zalando.nakadi.service.subscription.zk.NewZkSubscriptionClient;
 import org.zalando.nakadi.service.subscription.zk.SubscriptionClientFactory;
@@ -97,18 +100,21 @@ public class CursorsServiceAT extends BaseAT {
         final TimelineService timelineService = mock(TimelineService.class);
         when(timelineService.getTopicRepository((Timeline) any())).thenReturn(topicRepository);
         timeline = buildTimeline(etName, topic, CREATED_AT);
-        when(timelineService.getActiveTimeline(any())).thenReturn(timeline);
+        when(timelineService.getActiveTimeline(any(EventType.class))).thenReturn(timeline);
 
         final Subscription subscription = mock(Subscription.class);
         when(subscription.getId()).thenReturn(sid);
         when(subscription.getEventTypes()).thenReturn(ImmutableSet.of(etName));
         final SubscriptionDbRepository subscriptionRepo = mock(SubscriptionDbRepository.class);
         when(subscriptionRepo.getSubscription(sid)).thenReturn(subscription);
+        final SubscriptionCache subscriptionCache = mock(SubscriptionCache.class);
+        when(subscriptionCache.getSubscription(sid)).thenReturn(subscription);
         final SubscriptionClientFactory zkSubscriptionFactory = new SubscriptionClientFactory(zkHolder, MAPPER);
         uuidGenerator = mock(UUIDGenerator.class);
         when(uuidGenerator.isUUID(any())).thenReturn(true);
-        cursorsService = new CursorsService(subscriptionRepo, null,
-                mock(NakadiSettings.class), zkSubscriptionFactory, cursorConverter, uuidGenerator, null);
+        cursorsService = new CursorsService(subscriptionRepo, subscriptionCache, null, mock(NakadiSettings.class),
+                zkSubscriptionFactory, cursorConverter, uuidGenerator, null, mock(AuthorizationValidator.class),
+                mock(NakadiAuditLogPublisher.class));
 
         // Register cursors in converter
         registerNakadiCursor(NakadiCursor.of(buildTimeline(etName, topic, CREATED_AT), P1, NEW_OFFSET));

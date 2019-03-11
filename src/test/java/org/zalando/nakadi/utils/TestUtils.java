@@ -7,6 +7,7 @@ import org.apache.commons.io.IOUtils;
 import org.echocat.jomon.runtime.concurrent.RetryForSpecifiedTimeStrategy;
 import org.joda.time.DateTime;
 import org.joda.time.DateTimeZone;
+import org.json.JSONArray;
 import org.json.JSONObject;
 import org.mockito.ArgumentCaptor;
 import org.springframework.http.converter.StringHttpMessageConverter;
@@ -15,6 +16,7 @@ import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.validation.Errors;
 import org.springframework.validation.FieldError;
 import org.zalando.nakadi.config.JsonConfig;
+import org.zalando.nakadi.domain.BatchFactory;
 import org.zalando.nakadi.domain.BatchItem;
 import org.zalando.nakadi.domain.EventType;
 import org.zalando.nakadi.domain.Storage;
@@ -48,6 +50,7 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 import static org.springframework.test.web.servlet.setup.MockMvcBuilders.standaloneSetup;
 import static org.zalando.nakadi.utils.RandomSubscriptionBuilder.builder;
+import static org.zalando.problem.Status.UNPROCESSABLE_ENTITY;
 
 public class TestUtils {
 
@@ -173,6 +176,10 @@ public class TestUtils {
         return new ValidationProblem(errors);
     }
 
+    public static Problem createInvalidEventTypeExceptionProblem(final String message) {
+        return Problem.valueOf(UNPROCESSABLE_ENTITY, message);
+    }
+
     public static void waitFor(final Runnable runnable) {
         waitFor(runnable, 10000, 500);
     }
@@ -183,7 +190,7 @@ public class TestUtils {
 
     @SuppressWarnings("unchecked")
     public static void waitFor(final Runnable runnable, final long timeoutMs, final int intervalMs,
-                               final Class<? extends  Throwable>... additionalException) {
+                               final Class<? extends Throwable>... additionalException) {
         final List<Class<? extends Throwable>> leadToRetry =
                 Stream.concat(Stream.of(additionalException), Stream.of(AssertionError.class)).collect(toList());
         executeWithRetry(
@@ -194,11 +201,11 @@ public class TestUtils {
     }
 
     public static BatchItem createBatchItem(final JSONObject event) {
-        return new BatchItem(event.toString());
+        return BatchFactory.from(new JSONArray().put(event).toString()).get(0);
     }
 
     public static BatchItem createBatchItem(final String event) {
-        return new BatchItem(event);
+        return BatchFactory.from("[" + event + "]").get(0);
     }
 
     public static DateTime randomDate() {

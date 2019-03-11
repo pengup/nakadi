@@ -9,26 +9,29 @@ import org.zalando.nakadi.config.NakadiSettings;
 import org.zalando.nakadi.domain.BatchFactory;
 import org.zalando.nakadi.domain.BatchItem;
 import org.zalando.nakadi.domain.BatchItemResponse;
+import org.zalando.nakadi.domain.CleanupPolicy;
+import org.zalando.nakadi.domain.EventCategory;
 import org.zalando.nakadi.domain.EventPublishResult;
 import org.zalando.nakadi.domain.EventPublishingStatus;
 import org.zalando.nakadi.domain.EventPublishingStep;
 import org.zalando.nakadi.domain.EventType;
 import org.zalando.nakadi.domain.Timeline;
 import org.zalando.nakadi.enrichment.Enrichment;
-import org.zalando.nakadi.exceptions.EnrichmentException;
-import org.zalando.nakadi.exceptions.EventPublishingException;
-import org.zalando.nakadi.exceptions.EventTypeTimeoutException;
-import org.zalando.nakadi.exceptions.EventValidationException;
-import org.zalando.nakadi.exceptions.InternalNakadiException;
-import org.zalando.nakadi.exceptions.NoSuchEventTypeException;
-import org.zalando.nakadi.exceptions.PartitioningException;
 import org.zalando.nakadi.exceptions.runtime.AccessDeniedException;
+import org.zalando.nakadi.exceptions.runtime.EnrichmentException;
+import org.zalando.nakadi.exceptions.runtime.EventPublishingException;
+import org.zalando.nakadi.exceptions.runtime.EventTypeTimeoutException;
+import org.zalando.nakadi.exceptions.runtime.EventValidationException;
+import org.zalando.nakadi.exceptions.runtime.InternalNakadiException;
+import org.zalando.nakadi.exceptions.runtime.NoSuchEventTypeException;
+import org.zalando.nakadi.exceptions.runtime.PartitioningException;
 import org.zalando.nakadi.exceptions.runtime.ServiceTemporarilyUnavailableException;
 import org.zalando.nakadi.partitioning.PartitionResolver;
+import org.zalando.nakadi.partitioning.PartitionStrategy;
 import org.zalando.nakadi.repository.db.EventTypeCache;
-import org.zalando.nakadi.security.Client;
 import org.zalando.nakadi.service.timeline.TimelineService;
 import org.zalando.nakadi.service.timeline.TimelineSync;
+import org.zalando.nakadi.util.JsonPathAccess;
 import org.zalando.nakadi.validation.EventTypeValidator;
 import org.zalando.nakadi.validation.ValidationError;
 
@@ -38,6 +41,8 @@ import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.TimeoutException;
 import java.util.stream.Collectors;
+
+import static org.zalando.nakadi.validation.JsonSchemaEnrichment.DATA_PATH_PREFIX;
 
 @Component
 public class EventPublisher {
@@ -70,12 +75,14 @@ public class EventPublisher {
         this.authValidator = authValidator;
     }
 
-    public EventPublishResult publish(final String events, final String eventTypeName, final Client client)
+    public EventPublishResult publish(final String events, final String eventTypeName)
             throws NoSuchEventTypeException,
             InternalNakadiException,
+            EnrichmentException,
             EventTypeTimeoutException,
             AccessDeniedException,
-            ServiceTemporarilyUnavailableException {
+            ServiceTemporarilyUnavailableException,
+            PartitioningException{
         return publishInternal(events, eventTypeName, true);
     }
 
@@ -83,7 +90,7 @@ public class EventPublisher {
                                        final String eventTypeName,
                                        final boolean useAuthz)
             throws NoSuchEventTypeException, InternalNakadiException, EventTypeTimeoutException,
-            AccessDeniedException, ServiceTemporarilyUnavailableException {
+            AccessDeniedException, ServiceTemporarilyUnavailableException, EnrichmentException, PartitioningException {
 
         Closeable publishingCloser = null;
         final List<BatchItem> batch = BatchFactory.from(events);
@@ -97,12 +104,16 @@ public class EventPublisher {
 
             validate(batch, eventType);
             partition(batch, eventType);
+            setEventKey(batch, eventType);
             enrich(batch, eventType);
             submit(batch, eventType);
 
             return ok(batch);
         } catch (final EventValidationException e) {
-            LOG.debug("Event validation error: {}", e.getMessage());
+            LOG.info(
+                    "Event validation error: {}",
+                    Optional.ofNullable(e.getMessage()).map(s -> s.replaceAll("\n", "; ")).orElse(null)
+            );
             return aborted(EventPublishingStep.VALIDATING, batch);
         } catch (final PartitioningException e) {
             LOG.debug("Event partition error: {}", e.getMessage());
@@ -149,7 +160,8 @@ public class EventPublisher {
                 .collect(Collectors.toList());
     }
 
-    private void partition(final List<BatchItem> batch, final EventType eventType) throws PartitioningException {
+    private void partition(final List<BatchItem> batch, final EventType eventType)
+            throws PartitioningException {
         for (final BatchItem item : batch) {
             item.setStep(EventPublishingStep.PARTITIONING);
             try {
@@ -158,6 +170,32 @@ public class EventPublisher {
             } catch (final PartitioningException e) {
                 item.updateStatusAndDetail(EventPublishingStatus.FAILED, e.getMessage());
                 throw e;
+            }
+        }
+    }
+
+    private void setEventKey(final List<BatchItem> batch, final EventType eventType) {
+        if (eventType.getCleanupPolicy() == CleanupPolicy.COMPACT) {
+            for (final BatchItem item : batch) {
+                final String compactionKey = item.getEvent()
+                        .getJSONObject("metadata")
+                        .getString("partition_compaction_key");
+                item.setEventKey(compactionKey);
+            }
+        } else if (PartitionStrategy.HASH_STRATEGY.equals(eventType.getPartitionStrategy())) {
+            final List<String> partitionKeyFields = eventType.getPartitionKeyFields();
+            // we will set event key only if there is exactly one partition key field,
+            // in other case it's not clear what should be set as event key
+            if (partitionKeyFields.size() == 1) {
+                String partitionKeyField = partitionKeyFields.get(0);
+                if (EventCategory.DATA.equals(eventType.getCategory())) {
+                    partitionKeyField = DATA_PATH_PREFIX + partitionKeyField;
+                }
+                for (final BatchItem item : batch) {
+                    final JsonPathAccess jsonPath = new JsonPathAccess(item.getEvent());
+                    final String eventKey = jsonPath.get(partitionKeyField).toString();
+                    item.setEventKey(eventKey);
+                }
             }
         }
     }
@@ -187,7 +225,7 @@ public class EventPublisher {
         final Optional<ValidationError> validationError = validator.validate(event);
 
         if (validationError.isPresent()) {
-            throw new EventValidationException(validationError.get());
+            throw new EventValidationException(validationError.get().getMessage());
         }
     }
 

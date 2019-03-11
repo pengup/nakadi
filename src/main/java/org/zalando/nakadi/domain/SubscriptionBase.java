@@ -1,6 +1,7 @@
 package org.zalando.nakadi.domain;
 
 import com.google.common.collect.ImmutableList;
+import org.zalando.nakadi.plugin.api.authz.Resource;
 import org.zalando.nakadi.view.SubscriptionCursorWithoutToken;
 
 import javax.annotation.Nullable;
@@ -9,6 +10,7 @@ import javax.validation.constraints.NotNull;
 import javax.validation.constraints.Size;
 import java.util.Collections;
 import java.util.List;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 
@@ -40,6 +42,10 @@ public class SubscriptionBase {
     @Valid
     private List<SubscriptionCursorWithoutToken> initialCursors = ImmutableList.of();
 
+    @Nullable
+    @Valid
+    private SubscriptionAuthorization authorization;
+
     public SubscriptionBase() {
     }
 
@@ -49,6 +55,15 @@ public class SubscriptionBase {
         this.setConsumerGroup(subscriptionBase.getConsumerGroup());
         this.setReadFrom(subscriptionBase.getReadFrom());
         this.setInitialCursors(subscriptionBase.getInitialCursors());
+        this.setAuthorization(subscriptionBase.getAuthorization());
+    }
+
+    public SubscriptionAuthorization getAuthorization() {
+        return authorization;
+    }
+
+    public void setAuthorization(final SubscriptionAuthorization authorization) {
+        this.authorization = authorization;
     }
 
     public String getOwningApplication() {
@@ -100,20 +115,20 @@ public class SubscriptionBase {
             return false;
         }
         final SubscriptionBase that = (SubscriptionBase) o;
-        return owningApplication.equals(that.owningApplication)
-                && eventTypes.equals(that.eventTypes)
-                && consumerGroup.equals(that.consumerGroup)
-                && readFrom.equals(that.readFrom)
-                && initialCursors.equals(that.initialCursors);
+        return Objects.equals(owningApplication, that.owningApplication)
+                && Objects.equals(eventTypes, that.eventTypes)
+                && Objects.equals(consumerGroup, that.consumerGroup)
+                && Objects.equals(readFrom, that.readFrom)
+                && Objects.equals(authorization, that.authorization)
+                && Objects.equals(initialCursors, that.initialCursors);
     }
 
     @Override
     public int hashCode() {
-        int result = owningApplication != null ? owningApplication.hashCode() : 0;
-        result = 31 * result + (eventTypes != null ? eventTypes.hashCode() : 0);
-        result = 31 * result + (consumerGroup != null ? consumerGroup.hashCode() : 0);
-        result = 31 * result + (readFrom != null ? readFrom.hashCode() : 0);
-        result = 31 * result + (initialCursors != null ? initialCursors.hashCode() : 0);
-        return result;
+        return Objects.hash(owningApplication, eventTypes, consumerGroup, readFrom, initialCursors);
+    }
+
+    public Resource<SubscriptionBase> asBaseResource(final String id) {
+        return new ResourceImpl<>(id, ResourceImpl.SUBSCRIPTION_RESOURCE, getAuthorization(), this);
     }
 }
